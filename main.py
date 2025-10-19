@@ -1,3 +1,4 @@
+
 #  Moon-Userbot - telegram userbot
 #  Copyright (C) 2020-present Moon Userbot Organization
 #
@@ -125,6 +126,27 @@ async def main():
         level=logging.INFO,
     )
     DeleteAccount.__new__ = None
+
+    # Patch Pyrogram's remove_handler to suppress ValueError
+    from pyrogram import dispatcher
+    original_remove_handler = dispatcher.Dispatcher.remove_handler
+
+    async def patched_remove_handler(self, handler, group):
+        async def wrapped():
+            try:
+                self.groups[group].remove(handler)
+            except ValueError:
+                pass
+
+        await self.handler_worker_tasks[0]
+        await self.locks_list[group].acquire()
+
+        task = self.loop.create_task(wrapped())
+        await task
+
+        self.locks_list[group].release()
+
+    dispatcher.Dispatcher.remove_handler = patched_remove_handler
 
     try:
         await app.start()
