@@ -701,6 +701,205 @@ async def batch_terabox_download(client: Client, message: Message):
     except Exception as e:
         await status_msg.edit(f"❌ Error: <code>{format_exc(e)}</code>")
 
+###########################
+
+def get_download_target():
+    """Get the target channel for auto-downloads"""
+    return get_terabox_config().get("download_target")
+
+def set_download_target(chat_id):
+    """Set target channel for auto-downloads"""
+    cfg = get_terabox_config()
+    cfg["download_target"] = chat_id
+    save_terabox_config(cfg)
+
+def is_auto_download_enabled():
+    """Check if auto download is enabled"""
+    return get_terabox_config().get("auto_download_enabled", False)
+
+def toggle_auto_download():
+    """Toggle auto download feature"""
+    cfg = get_terabox_config()
+    cfg["auto_download_enabled"] = not cfg.get("auto_download_enabled", False)
+    save_terabox_config(cfg)
+    return cfg["auto_download_enabled"]
+
+def get_download_source():
+    """Get the source channel to monitor for downloads"""
+    return get_terabox_config().get("download_source")
+
+def set_download_source(chat_id):
+    """Set source channel to monitor for auto-downloads"""
+    cfg = get_terabox_config()
+    cfg["download_source"] = chat_id
+    save_terabox_config(cfg)
+
+
+# === NEW COMMANDS FOR AUTO DOWNLOAD ===
+
+@Client.on_message(filters.command("settbdl", prefix) & filters.me)
+async def set_tbdl_target(client: Client, message: Message):
+    """
+    Set target channel for auto-downloading TeraBox links
+    Usage: .settbdl [chat_id]
+    """
+    if len(message.command) < 2:
+        return await message.edit(f"Usage: <code>{prefix}settbdl [chat_id]</code>")
+    
+    try:
+        chat_id = int(message.command[1])
+        set_download_target(chat_id)
+        await message.edit(f"✅ Set TeraBox auto-download target to <code>{chat_id}</code>")
+    except ValueError:
+        await message.edit("❌ Invalid chat ID. Must be a number.")
+
+
+@Client.on_message(filters.command("addtbdl", prefix) & filters.me)
+async def set_tbdl_source(client: Client, message: Message):
+    """
+    Set source channel to monitor for TeraBox links to auto-download
+    Usage: .addtbdl [chat_id]
+    """
+    if len(message.command) < 2:
+        return await message.edit(f"Usage: <code>{prefix}settbdlsrc [chat_id]</code>")
+    
+    try:
+        chat_id = int(message.command[1])
+        set_download_source(chat_id)
+        await message.edit(f"✅ Set TeraBox auto-download source to <code>{chat_id}</code>")
+    except ValueError:
+        await message.edit("❌ Invalid chat ID. Must be a number.")
+
+
+@Client.on_message(filters.command("autotbdl", prefix) & filters.me)
+async def toggle_auto_tbdl(client: Client, message: Message):
+    """
+    Toggle automatic TeraBox downloading
+    Usage: .autotbdl
+    """
+    state = toggle_auto_download()
+    await message.edit(
+        f"{'✅' if state else '❌'} <b>Auto TeraBox Download</b> {'enabled' if state else 'disabled'}.\n\n"
+        f"💡 Links from source channel will be automatically downloaded and uploaded to target channel."
+    )
+
+
+@Client.on_message(filters.command("tbdlstatus", prefix) & filters.me)
+async def show_tbdl_status(client: Client, message: Message):
+    """
+    Show auto-download configuration status
+    Usage: .tbdlstatus
+    """
+    cfg = get_terabox_config()
+    enabled = cfg.get("auto_download_enabled", False)
+    source = cfg.get("download_source")
+    target = cfg.get("download_target")
+    
+    status = "✅ Enabled" if enabled else "❌ Disabled"
+    
+    text = (
+        f"<b>🤖 TeraBox Auto-Download Status</b>\n\n"
+        f"<b>Status:</b> {status}\n"
+        f"<b>Source Channel:</b> <code>{source if source else 'Not set'}</code>\n"
+        f"<b>Target Channel:</b> <code>{target if target else 'Not set'}</code>\n\n"
+        f"💡 <b>How it works:</b>\n"
+        f"• Monitors source channel for TeraBox links\n"
+        f"• Auto-downloads files\n"
+        f"• Uploads to target channel\n"
+    )
+    
+    await message.edit(text)
+
+
+# === AUTO DOWNLOAD HANDLER ===
+
+@Client.on_message(~filters.me)
+async def terabox_auto_download_handler(client: Client, message: Message):
+    """
+    Automatically download and upload TeraBox links from monitored channel
+    """
+    # Check if auto-download is enabled
+    if not is_auto_download_enabled():
+        return
+    
+    # Get config
+    source = get_download_source()
+    target = get_download_target()
+    
+    # Validate configuration
+    if not source or not target:
+        return
+    
+    # Check if message is from the source channel
+    if message.chat.id != source:
+        return
+    
+    # Extract text from message
+    text = message.text or message.caption
+    if not text:
+        return
+    
+    # Find TeraBox links
+    links = extract_terabox_links(text)
+    if not links:
+        return
+    
+    # Process each link
+    for link in links:
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Fetch file info
+                data = await fetch_terabox_info(session, link)
+                
+                if not data or data.get("count", 0) == 0:
+                    continue
+                
+                file_links = data.get("links", [])
+                if not file_links:
+                    continue
+                
+                file_info = file_links[0]
+                file_name = file_info.get("name", "terabox_file")
+                file_size_mb = file_info.get("size_mb", 0)
+                download_url = file_info.get("direct_url")
+                category = file_info.get("category", "1")
+                
+                # Download file
+                temp_file = f"/tmp/{file_name}"
+                success, speed, downloaded_bytes = await download_file_optimized(
+                    session, download_url, temp_file
+                )
+                
+                if not success:
+                    continue
+                
+                # Upload to target channel (without caption)
+                if category == "1":
+                    await client.send_video(
+                        int(target),
+                        video=temp_file
+                    )
+                else:
+                    await client.send_document(
+                        int(target),
+                        document=temp_file
+                    )
+                
+                # Cleanup
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                
+                # Small delay to avoid rate limiting
+                await asyncio.sleep(3)
+                
+        except Exception as e:
+            print(f"[TeraBox AutoDL] Error processing {link}: {e}")
+            continue
+
+############################
+
+
+
 # === HELP MENU ===
 modules_help["terabox"] = {
     "importlinks": "Import links from JSON file to DB (reply to file)",
@@ -715,4 +914,8 @@ modules_help["terabox"] = {
     "listtb": "Show TeraBox forwarding config",
     "cleartbdb": "Clear seen links (allow re-forwarding)",
     "tbdl [url]": "Download videos/files from TeraBox with optimized server-side downloading",
+    "settbdl [chat_id]": "Set target channel for auto-downloading TeraBox links",
+    "addtbdl [chat_id]": "Set source channel to monitor for TeraBox links",
+    "autotbdl": "Toggle automatic TeraBox download & upload",
+    "tbdlstatus": "Show auto-download configuration status",
 }
