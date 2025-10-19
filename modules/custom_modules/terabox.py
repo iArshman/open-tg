@@ -590,16 +590,11 @@ async def download_and_upload(session, client, link, chat_id, semaphore, output_
                 return {"url": link, "status": "❌ Download failed"}
 
             # === Upload ===
-            caption = (
-                f"<b>{file_name}</b>\n"
-                f"💾 <code>{file_size} MB</code>\n"
-                f"⚡ <code>{speed:.2f} MB/s</code>"
-            )
 
             if category == "1":
-                await client.send_video(chat_id, video=str(file_path), caption=caption)
+                await client.send_video(chat_id, video=str(file_path))
             else:
-                await client.send_document(chat_id, document=str(file_path), caption=caption)
+                await client.send_document(chat_id, document=str(file_path) )
 
             # Delete file after upload to save space
             os.remove(file_path)
