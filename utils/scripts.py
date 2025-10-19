@@ -504,13 +504,9 @@ async def unload_module(module_name: str, client: Client) -> bool:
 
     for _name, obj in vars(module).items():
         for handler, group in getattr(obj, "handlers", []):
-            try:
-                client.remove_handler(handler, group)
-            except ValueError:
-                pass
+            client.remove_handler(handler, group)
 
-    if module_name in modules_help:
-        del modules_help[module_name]
+    del modules_help[module_name]
     del sys.modules[path]
 
     return True
