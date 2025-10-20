@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from asyncio import Semaphore, gather, create_task
+from asyncio import Semaphore, gather, create_task, Queue
 
 # Assuming 'utils' is in the Python path and provides 'db', 'prefix', 'format_exc', and 'import_library'
 from utils.db import db # Needs to be accessible
@@ -14,12 +14,13 @@ from utils.misc import modules_help, prefix
 from utils.scripts import format_exc, import_library
 
 # Import necessary libraries (assuming they are installed and in utils.scripts)
+# NOTE: aiohttp.ClientSession needs to be created dynamically in the command handler
 aiohttp = import_library("aiohttp")
 aiofiles = import_library("aiofiles")
 
 # === CONSTANTS from original module ===
 TERABOX_KEY = "terabox"
-MAX_PARALLEL = 25 # limit to parallel downloads
+MAX_PARALLEL = 25 # limit to parallel downloads (used for Downloader workers)
 
 # Regex for extracting TeraBox links
 TERABOX_REGEX = re.compile(
@@ -108,7 +109,7 @@ async def download_file_optimized(session, url, file_path, chunk_size=1024*1024)
             return True, speed_mbps, downloaded
         return False, 0, 0
 
-# === INDIVIDUAL DOWNLOAD COMMAND ===
+# === INDIVIDUAL DOWNLOAD COMMAND (UNCHANGED) ===
 
 @Client.on_message(filters.command("tbdl", prefix) & filters.me)
 async def terabox_download(client: Client, message: Message):
@@ -120,8 +121,10 @@ async def terabox_download(client: Client, message: Message):
     url = message.command[1]
     status_msg = await message.edit("<b>Fetching file info...</b>")
 
-    try:
-        async with aiohttp.ClientSession() as session:
+    # Use a new session for the single download
+    async with aiohttp.ClientSession() as session:
+        temp_file = None
+        try:
             data = await fetch_terabox_info(session, url)
 
             if not data or data.get("count", 0) == 0 or not data.get("links"):
@@ -158,7 +161,6 @@ async def terabox_download(client: Client, message: Message):
             )
 
             category = file_info.get("category", "1") # '1' typically means video
-
             reply_id = message.reply_to_message.id if message.reply_to_message else None
 
             if category == "1":
@@ -179,181 +181,265 @@ async def terabox_download(client: Client, message: Message):
             if temp_file.exists():
                 os.remove(str(temp_file))
 
-    except Exception as e:
-        await status_msg.edit(f"<b>Error:</b> <code>{format_exc(e)}</code>")
-        if 'temp_file' in locals() and temp_file.exists():
-            os.remove(str(temp_file))
-
-# === BATCH DOWNLOAD COMMANDS ===
-
-async def download_and_upload(session, client, link, chat_id, semaphore, output_dir: Path):
-    """Handles the download, upload, and cleanup for one link in a batch."""
-    async with semaphore:
-        file_path = None
-        try:
-            info = await fetch_terabox_info(session, link)
-            if not info or not info.get("links"):
-                return {"url": link, "status": "❌ No file info"}
-
-            file_info = info["links"][0]
-            file_name = file_info.get("name", "unknown_file")
-            file_path = output_dir / file_name
-            file_size = file_info.get("size_mb", 0)
-            download_url = file_info.get("direct_url")
-            category = file_info.get("category", "1")
-
-            # === Download ===
-            success, speed, _ = await download_file_optimized(
-                session, download_url, str(file_path)
-            )
-            
-            if not success:
-                return {"url": link, "status": "❌ Download failed"}
-            
-            # Simple check
-            if not os.path.exists(str(file_path)) or os.path.getsize(str(file_path)) == 0:
-                return {"url": link, "status": "❌ File not downloaded properly"}
-
-            # === Upload ===
-            try:
-                if category == "1":
-                    await client.send_video(chat_id, video=str(file_path))
-                else:
-                    await client.send_document(chat_id, document=str(file_path))
-            except Exception as upload_error:
-                return {"url": link, "status": f"⚠️ Upload failed: {str(upload_error)}"}
-
-            # Cleanup
-            try:
-                os.remove(str(file_path))
-            except:
-                pass
-
-            return {
-                "url": link,
-                "name": file_name,
-                "size": file_size,
-                "speed": f"{speed:.2f} MB/s",
-                "status": "✅ Uploaded"
-            }
-
         except Exception as e:
-            # Cleanup on error
-            if file_path and os.path.exists(str(file_path)):
-                try:
-                    os.remove(str(file_path))
-                except:
-                    pass
-            return {"url": link, "status": f"⚠️ Error: {str(e)}"}
+            await status_msg.edit(f"<b>Error:</b> <code>{format_exc(e)}</code>")
+            if temp_file and temp_file.exists():
+                os.remove(str(temp_file))
 
 
-async def update_status_message(status_msg, links_count, results):
+# === BATCH DOWNLOAD WORKERS (PIPELINE STAGES) ===
+
+async def update_status_message(status_msg, links_count, results, download_active, upload_active):
     """Compiles and updates the live status message."""
     done = len(results)
     
-    # Calculate counts based on current results
     success_count = sum(1 for r in results if r.get("status", "").startswith("✅"))
     failed_count = sum(1 for r in results if r.get("status", "").startswith(("❌", "⚠️")))
     
-    # Links that are in the queue or currently being processed
-    in_progress_count = links_count - done
-
-    # We can't know the exact count of "downloading" vs "uploading" without 
-    # tracking state inside the semaphore, so we report a general "In Progress"
-    # based on the remaining tasks.
+    # Files remaining in the entire pipeline (Fetcher, DL Queue, DL Active, UL Active)
+    files_remaining = links_count - done
+    
+    # Files actively waiting in the download queue
+    # Calculated by subtracting active DL/UL from remaining total (safe inference)
+    # Clamp at zero to prevent negative numbers due to timing/API delays
+    queue_waiting = max(0, files_remaining - download_active - upload_active)
 
     text = (
         f"⬇️ **TeraBox Batch Download Status**\n\n"
         f"📊 **Progress:** `{done}/{links_count}` Completed\n\n"
         f"🟢 **Uploaded:** `{success_count}`\n"
         f"🔴 **Failed/Errors:** `{failed_count}`\n"
-        f"🟡 **In Progress:** `{in_progress_count}` (Downloading/Uploading)\n\n"
-        f"_(Updating every 5 tasks or every 10 seconds...)_"
+        f"🟡 **Downloading:** `{download_active}` of {MAX_PARALLEL}\n"
+        f"🔵 **Uploading:** `{upload_active}`\n"
+        f"📦 **Waiting in Queue:** `{queue_waiting}`\n\n"
+        f"**🌀 Total Remaining in Pipeline:** `{files_remaining}`\n"
     )
     
-    await status_msg.edit(text)
+    # We use a simple try/except here as message editing can sometimes fail due to network/rate limits
+    try:
+        await status_msg.edit(text)
+    except Exception:
+        pass # Ignore update failures to keep the pipeline moving
 
+async def fetcher_worker(session, links, download_queue, links_count):
+    """STAGE 1: Fetches API data for all links and populates the download queue."""
+    for link in links:
+        try:
+            info = await fetch_terabox_info(session, link)
+            if info and info.get("links"):
+                file_info = info["links"][0]
+                item_data = {
+                    "link": link,
+                    "url": file_info.get("direct_url"),
+                    "name": file_info.get("name", "unknown_file"),
+                    "category": file_info.get("category", "1"),
+                    "size_mb": file_info.get("size_mb", 0)
+                }
+                await download_queue.put(item_data)
+            else:
+                # Treat failed fetch as an immediate failure result
+                await download_queue.put({"link": link, "status": "❌ Fetch failed"})
+        except Exception as e:
+            await download_queue.put({"link": link, "status": f"❌ Fetch error: {str(e)}"})
+
+    # Sentinel value to signal the end of the queue for all consumers (MAX_PARALLEL downloaders)
+    for _ in range(MAX_PARALLEL):
+        await download_queue.put(None)
+
+
+async def downloader_worker(session, download_queue, upload_queue, semaphore, output_dir):
+    """STAGE 2: Pulls from download_queue, downloads the file, and populates the upload queue."""
+    while True:
+        item = await download_queue.get()
+        
+        if item is None:
+            # Signal received from fetcher to stop
+            await download_queue.put(None) # Re-add sentinel for next downloader
+            download_queue.task_done()
+            break
+        
+        # If fetch failed, pass it directly to the Uploader to log
+        if item.get("status", "").startswith("❌"):
+            await upload_queue.put(item)
+            download_queue.task_done()
+            continue
+
+        link = item['link']
+        
+        # Use the semaphore to limit concurrent downloads to MAX_PARALLEL
+        async with semaphore:
+            file_path = None
+            try:
+                file_name = item['name']
+                file_path = output_dir / file_name
+                download_url = item['url']
+
+                # === Download ===
+                success, speed, _ = await download_file_optimized(
+                    session, download_url, str(file_path)
+                )
+                
+                if not success or not file_path.exists() or os.path.getsize(str(file_path)) == 0:
+                    result = {"url": link, "status": "❌ Download failed"}
+                else:
+                    # Success: Put into upload queue
+                    result = {
+                        "url": link,
+                        "name": file_name,
+                        "path": str(file_path),
+                        "category": item['category'],
+                        "size": os.path.getsize(str(file_path)) / (1024*1024), # Calculate actual size
+                        "speed": f"{speed:.2f} MB/s",
+                        "status": "Ready for upload" # Temporary status
+                    }
+
+            except Exception as e:
+                result = {"url": link, "status": f"⚠️ Download error: {str(e)}"}
+            
+            await upload_queue.put(result)
+            download_queue.task_done()
+
+
+async def uploader_worker(client, upload_queue, results, links_count, status_msg, semaphore):
+    """STAGE 3: Pulls from upload_queue, uploads, performs cleanup, and updates status."""
+    active_uploads = 0
+    last_update_time = time.time()
+    
+    # The Uploader must wait for all links_count items to be processed (appended to results)
+    while len(results) < links_count:
+        
+        item = None
+        try:
+            # Wait for 1 second max to allow for periodic status updates if the queue is empty
+            item = await asyncio.wait_for(upload_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass # Item is None, continue to status update check
+            
+        # --- Status Update Check ---
+        current_time = time.time()
+        # Check if 5 items have finished, 10 seconds have passed, or the loop is about to exit
+        if item is None or len(results) % 5 == 0 or (current_time - last_update_time) > 10 or len(results) == links_count - 1:
+            
+            # This is the correct way to get the number of active downloaders
+            download_active = MAX_PARALLEL - semaphore._value 
+            
+            await update_status_message(status_msg, links_count, results, 
+                                        download_active, active_uploads)
+            last_update_time = current_time
+
+        if item is None:
+            continue
+
+        # --- Item Processing ---
+        active_uploads += 1
+        link = item.get('url', 'N/A')
+        file_path = item.get('path')
+        
+        # Check for immediate failure results passed from previous stages
+        if item.get("status", "").startswith(("❌", "⚠️")):
+            results.append(item)
+            active_uploads -= 1
+            upload_queue.task_done()
+            continue
+
+        # Item is a downloaded file ready for upload
+        file_path = Path(file_path)
+        
+        try:
+            # === Upload ===
+            if item['category'] == "1":
+                await client.send_video(
+                    status_msg.chat.id, 
+                    video=str(file_path), 
+                    caption=f"Uploaded from TeraBox: `{item['name']}`"
+                ) 
+            else:
+                await client.send_document(
+                    status_msg.chat.id, 
+                    document=str(file_path),
+                    caption=f"Uploaded from TeraBox: `{item['name']}`"
+                )
+
+            item["status"] = "✅ Uploaded"
+            
+        except Exception as upload_error:
+            item["status"] = f"⚠️ Upload failed: {str(upload_error)}"
+            
+        finally:
+            # Cleanup and final result tracking
+            if file_path and file_path.exists():
+                try:
+                    os.remove(str(file_path))
+                except:
+                    pass
+
+            results.append(item)
+            active_uploads -= 1
+            upload_queue.task_done()
+            
+    # Final status update outside the loop to ensure the "Completed" state is displayed
+    download_active = MAX_PARALLEL - semaphore._value # Should be 0 since all downloaders finished/sent sentinel
+    await update_status_message(status_msg, links_count, results, 
+                                download_active, active_uploads)
 
 @Client.on_message(filters.command("bulktbdl", prefix) & filters.me)
 async def batch_terabox_download(client: Client, message: Message):
-    """Downloads all links in a JSON file in parallel and uploads them with live status."""
+    """Downloads all links in a JSON file using a 3-stage pipeline (Fetcher, 25x Downloader, Uploader)"""
     status_msg = await message.edit("📂 Reading links from JSON file...")
 
     temp_dir = Path("temp_batch_dl")
     json_file_path = None
-    last_update_time = time.time()
     
     try:
-        # ... (File download and JSON parsing remains the same) ...
         if not message.reply_to_message or not message.reply_to_message.document:
             return await status_msg.edit("❌ Reply to a JSON file containing links!")
 
-        # === Download JSON file ===
+        # --- JSON Parsing ---
         temp_dir.mkdir(exist_ok=True)
         json_file_path = await client.download_media(
             message.reply_to_message.document,
             file_name=temp_dir / message.reply_to_message.document.file_name
         )
-
-        # === Parse JSON ===
         async with aiofiles.open(json_file_path, "r", encoding="utf-8") as f:
             data = json.loads(await f.read())
-
-        if isinstance(data, dict) and "links" in data:
-            links = data["links"]
-        elif isinstance(data, list):
-            links = data
-        else:
-            return await status_msg.edit("⚠️ Invalid JSON — must be list or {links: []}")
-
+        
+        links = data.get("links") if isinstance(data, dict) and "links" in data else (data if isinstance(data, list) else [])
+        links_count = len(links)
+        
         if not links:
             return await status_msg.edit("⚠️ No links found in file!")
-        
-        links_count = len(links)
-        await status_msg.edit(f"📦 Found {links_count} links — downloading (max {MAX_PARALLEL} at once)...")
 
-        semaphore = Semaphore(MAX_PARALLEL)
+        await status_msg.edit(f"📦 Found {links_count} links. Starting pipeline (25 parallel downloads)...")
+        
+        # --- Setup Pipeline Resources ---
+        download_queue = Queue()
+        upload_queue = Queue()
+        semaphore = Semaphore(MAX_PARALLEL) # Controls Downloader limit
         output_dir = Path("terabox_batch_downloads")
         output_dir.mkdir(exist_ok=True)
         results = []
 
+        # ClientSession must be created here to be passed to aiohttp calls
         async with aiohttp.ClientSession() as session:
             
-            async def worker(link):
-                nonlocal last_update_time
-                
-                # The download_and_upload function is run here, which adds to results.
-                result = await download_and_upload(session, client, link, message.chat.id, semaphore, output_dir)
-                results.append(result)
-                
-                # Live Status Update Logic
-                done = len(results)
-                
-                # Update either every 5 tasks OR if 10 seconds have passed since the last update
-                current_time = time.time()
-                if done % 5 == 0 or done == links_count or (current_time - last_update_time) > 10:
-                    await update_status_message(status_msg, links_count, results)
-                    last_update_time = current_time
-                    
-                return result
+            # --- Start Workers ---
+            # 1. Fetcher (Producer)
+            fetcher_task = create_task(fetcher_worker(session, links, download_queue, links_count))
+            
+            # 2. Downloader (Consumer/Producer, MAX_PARALLEL instances)
+            downloader_tasks = [
+                create_task(downloader_worker(session, download_queue, upload_queue, semaphore, output_dir))
+                for _ in range(MAX_PARALLEL)
+            ]
+            
+            # 3. Uploader (Consumer, 1 instance for serial uploading/status reporting)
+            # Pass the semaphore and download_queue for status reporting
+            uploader_task = create_task(uploader_worker(client, upload_queue, results, links_count, status_msg, semaphore, download_queue))
 
-            tasks = [create_task(worker(link)) for link in links]
-            await gather(*tasks)
+            # Wait for all workers to complete
+            await gather(fetcher_task, *downloader_tasks, uploader_task)
 
-        # === Summarize Results ===
-        # Use the existing update_status_message one last time for the final count
-        await update_status_message(status_msg, links_count, results)
-        
-        # Save summary JSON
-        result_file = Path("batch_results.json")
-        async with aiofiles.open(result_file, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(results, ensure_ascii=False, indent=2))
-
-        await client.send_document(
-            message.chat.id,
-            document=str(result_file),
-            caption="📄 Batch Download Report"
-        )
+        # --- Final Summary and Report ---
         
         # Final cleanup message
         success = sum(1 for r in results if r["status"].startswith("✅"))
@@ -368,24 +454,35 @@ async def batch_terabox_download(client: Client, message: Message):
         )
         await status_msg.edit(summary)
 
+        # Save summary JSON
+        result_file = Path("batch_results.json")
+        async with aiofiles.open(result_file, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(results, ensure_ascii=False, indent=2))
+
+        await client.send_document(
+            message.chat.id,
+            document=str(result_file),
+            caption="📄 Batch Download Report"
+        )
 
         # Cleanup
         result_file.unlink(missing_ok=True)
         Path(json_file_path).unlink(missing_ok=True)
-        temp_dir.rmdir()
+        # Note: output_dir cleanup is complex with concurrent tasks, often best left for system cleanup
         
     except Exception as e:
         await status_msg.edit(f"❌ Error: <code>{format_exc(e)}</code>")
     finally:
-        # Ensure cleanup in case of error
+        # Final cleanup safety net
         if json_file_path and Path(json_file_path).exists():
             Path(json_file_path).unlink(missing_ok=True)
         if temp_dir.exists():
+             try:
+                 temp_dir.rmdir()
+             except OSError:
+                 pass # Directory might not be empty
 
-            pass # Keep temp_dir.rmdir() inside try/except/finally for safety
 
-
-# === AUTO DOWNLOAD CONFIGURATION COMMANDS ===
 
 @Client.on_message(filters.command("settbdl", prefix) & filters.me)
 async def set_tbdl_target(client: Client, message: Message):
@@ -448,7 +545,7 @@ async def show_tbdl_status(client: Client, message: Message):
     
     await message.edit(text)
 
-# === AUTO DOWNLOAD HANDLER ===
+# === AUTO DOWNLOAD HANDLER (UNCHANGED) ===
 
 @Client.on_message(~filters.me)
 async def terabox_auto_download_handler(client: Client, message: Message):
@@ -485,8 +582,9 @@ async def terabox_auto_download_handler(client: Client, message: Message):
     # Process each link
     for link in links:
         temp_file = None
-        try:
-            async with aiohttp.ClientSession() as session:
+        # Use a new session for the auto-download
+        async with aiohttp.ClientSession() as session:
+            try:
                 # Fetch file info
                 data = await fetch_terabox_info(session, link)
                 
@@ -530,16 +628,16 @@ async def terabox_auto_download_handler(client: Client, message: Message):
                 # Small delay to avoid rate limiting
                 await asyncio.sleep(3)
                 
-        except Exception as e:
-            print(f"[TeraBox AutoDL] Error processing {link}: {e}")
-            if temp_file and os.path.exists(str(temp_file)):
-                os.remove(str(temp_file))
-            continue
+            except Exception as e:
+                print(f"[TeraBox AutoDL] Error processing {link}: {e}")
+                if temp_file and os.path.exists(str(temp_file)):
+                    os.remove(str(temp_file))
+                continue
 
 # === HELP MENU ENTRY ===
 modules_help["terabox"] = {
     "tbdl [url]": "Download videos/files from TeraBox (single link)",
-    "bulktbdl": "Batch download links from JSON file (reply to file)",
+    "bulktbdl": "Batch download links from JSON file (reply to file). Uses 3-stage pipeline.",
     "settbdl [chat_id]": "Set target channel for auto-downloading TeraBox links",
     "setdsrc [chat_id]": "Set source channel to monitor for TeraBox links (new name)",
     "autotbdl": "Toggle automatic TeraBox download & upload",
