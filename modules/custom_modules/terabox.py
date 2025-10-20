@@ -563,572 +563,7 @@ async def terabox_download(client: Client, message: Message):
 
 from asyncio import Semaphore, gather, create_task
 
-import re
-import time
-import asyncio
-from pyrogram import Client, filters
-from pyrogram.types import Message
-
-from utils.db import db
-from utils.misc import modules_help, prefix
-from utils.scripts import format_exc
-
-import json
-from pathlib import Path
-import aiofiles
-
-# === CONSTANTS ===
-TERABOX_REGEX = re.compile(
-    r"https?://[^\s]*?(?:terabox|teraboxapp|teraboxshare|nephobox|1024tera|1024terabox|freeterabox|terasharefile|terasharelink|mirrobox|momerybox|teraboxlink)\.[^\s]+",
-    re.IGNORECASE
-)
-
-TERABOX_KEY = "terabox"
-ALLLINKS_KEY = "alllinks"
-
-# === ALL LINKS DB FUNCTIONS ===
-def get_all_links():
-    """Get all stored links from DB"""
-    return db.get(ALLLINKS_KEY, "links", [])
-
-def save_all_links(links):
-    """Save links to DB"""
-    db.set(ALLLINKS_KEY, "links", links)
-
-def normalize_link(link: str) -> str:
-    """Normalize TeraBox links for comparison"""
-    return link.rstrip("/").lower()
-
-def add_links_to_db(new_links: list) -> dict:
-    """
-    Add new links to DB without duplicates
-    Returns: {"added": count, "duplicates_skipped": count, "total": count}
-    """
-    existing_links = get_all_links()
-    existing_normalized = {normalize_link(l) for l in existing_links}
-    
-    added_count = 0
-    duplicates_skipped = 0
-    
-    for link in new_links:
-        normalized = normalize_link(link)
-        if normalized not in existing_normalized:
-            existing_links.append(link)
-            existing_normalized.add(normalized)
-            added_count += 1
-        else:
-            duplicates_skipped += 1
-    
-    save_all_links(existing_links)
-    
-    return {
-        "added": added_count,
-        "duplicates_skipped": duplicates_skipped,
-        "total": len(existing_links)
-    }
-
-def clear_all_links_db():
-    """Clear all links from DB"""
-    save_all_links([])
-    return True
-
-def get_links_count():
-    """Get total count of stored links"""
-    return len(get_all_links())
-
-# === NEW UNIFIED DB STRUCTURE ===
-def get_terabox_config():
-    """Return the full terabox config dict"""
-    return db.get(TERABOX_KEY, "config", {
-        "enabled": False,
-        "target": None,
-        "sources": [],
-        "seen_links": [],
-    })
-
-def save_terabox_config(config):
-    """Save the full terabox config dict"""
-    db.set(TERABOX_KEY, "config", config)
-
-# === CONFIG HELPERS ===
-def is_terabox_enabled():
-    return get_terabox_config().get("enabled", False)
-
-def toggle_terabox():
-    cfg = get_terabox_config()
-    cfg["enabled"] = not cfg.get("enabled", False)
-    save_terabox_config(cfg)
-    return cfg["enabled"]
-
-def get_target_chat():
-    return get_terabox_config().get("target")
-
-def set_target_chat(chat_id):
-    cfg = get_terabox_config()
-    cfg["target"] = chat_id
-    save_terabox_config(cfg)
-
-def get_sources():
-    return get_terabox_config().get("sources", [])
-
-def add_source(chat_id):
-    cfg = get_terabox_config()
-    if chat_id not in cfg["sources"]:
-        cfg["sources"].append(chat_id)
-        save_terabox_config(cfg)
-
-def remove_source(chat_id):
-    cfg = get_terabox_config()
-    if chat_id in cfg["sources"]:
-        cfg["sources"].remove(chat_id)
-        save_terabox_config(cfg)
-
-def record_link(link: str):
-    """Store link in terabox seen links"""
-    cfg = get_terabox_config()
-    normalized = normalize_link(link)
-    seen_normalized = [normalize_link(l) for l in cfg["seen_links"]]
-    
-    if normalized not in seen_normalized:
-        cfg["seen_links"].append(link)
-        save_terabox_config(cfg)
-        return True
-    return False
-
-def clear_terabox_db():
-    cfg = get_terabox_config()
-    cfg["seen_links"] = []
-    save_terabox_config(cfg)
-    return True
-
-# === HELPERS ===
-def extract_terabox_links(text: str):
-    if not text:
-        return []
-    return TERABOX_REGEX.findall(text)
-
-# === IMPORT LINKS FROM FILE ===
-@Client.on_message(filters.command("importlinks", prefix) & filters.me)
-async def import_links_from_file(client: Client, message: Message):
-    """
-    Reply to a JSON file with: .importlinks
-    Fetches all links and saves to DB without duplicates
-    """
-    status_msg = await message.edit("🔍 Analyzing replied file...")
-    
-    try:
-        if not message.reply_to_message or not message.reply_to_message.document:
-            return await status_msg.edit(
-                f"❌ Reply to a JSON file!\n"
-                f"Usage: Reply to JSON file → <code>{prefix}importlinks</code>"
-            )
-        
-        replied_msg = message.reply_to_message
-        
-        # Download file
-        temp_dir = Path("temp_import")
-        temp_dir.mkdir(exist_ok=True)
-        
-        await status_msg.edit("📥 Downloading file...")
-        
-        file_path = await client.download_media(
-            replied_msg.document,
-            file_name=temp_dir / replied_msg.document.file_name
-        )
-        
-        await status_msg.edit("📖 Reading file...")
-        
-        # Read and parse JSON
-        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
-            content = await f.read()
-            data = json.loads(content)
-        
-        # Handle different JSON structures
-        if isinstance(data, dict) and "links" in data:
-            links = data.get("links", [])
-        else:
-            links = data if isinstance(data, list) else []
-        
-        if not links:
-            return await status_msg.edit("⚠️ No links found in file!")
-        
-        await status_msg.edit(f"💾 Saving {len(links)} links to DB (checking for duplicates)...")
-        
-        # Add links to DB
-        result = add_links_to_db(links)
-        
-        # Send response
-        await status_msg.edit(
-            f"✅ **Import Complete!**\n\n"
-            f"📊 **Stats:**\n"
-            f"• Links in file: {len(links)}\n"
-            f"• Added to DB: {result['added']}\n"
-            f"• Duplicates skipped: {result['duplicates_skipped']}\n"
-            f"• Total in DB: {result['total']}"
-        )
-        
-        # Cleanup
-        Path(file_path).unlink(missing_ok=True)
-        temp_dir.rmdir()
-        
-    except json.JSONDecodeError:
-        await status_msg.edit("❌ Invalid JSON file format!")
-    except Exception as e:
-        await status_msg.edit(f"❌ Error: {format_exc(e)}")
-
-
-# === BATCH IMPORT MULTIPLE FILES ===
-@Client.on_message(filters.command("batchimport", prefix) & filters.me)
-async def batch_import_files(client: Client, message: Message):
-    """
-    Reply to message with multiple files: .batchimport
-    Imports all files and saves to DB
-    """
-    status_msg = await message.edit("🔍 Checking for files...")
-    
-    try:
-        if not message.reply_to_message:
-            return await status_msg.edit(
-                f"❌ Reply to message with files!\n"
-                f"Usage: Reply → <code>{prefix}batchimport</code>"
-            )
-        
-        replied_msg = message.reply_to_message
-        
-        if not replied_msg.document:
-            return await status_msg.edit("❌ No files found in replied message!")
-        
-        temp_dir = Path("temp_batch_import")
-        temp_dir.mkdir(exist_ok=True)
-        
-        total_links = 0
-        total_added = 0
-        total_duplicates = 0
-        files_processed = 0
-        
-        # Download and process file
-        await status_msg.edit("📥 Downloading file...")
-        
-        file_path = await client.download_media(
-            replied_msg.document,
-            file_name=temp_dir / replied_msg.document.file_name
-        )
-        
-        await status_msg.edit("📖 Reading and processing file...")
-        
-        # Read JSON
-        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
-            content = await f.read()
-            data = json.loads(content)
-        
-        # Extract links
-        if isinstance(data, dict) and "links" in data:
-            links = data.get("links", [])
-        else:
-            links = data if isinstance(data, list) else []
-        
-        if links:
-            result = add_links_to_db(links)
-            total_links += len(links)
-            total_added += result['added']
-            total_duplicates += result['duplicates_skipped']
-            files_processed += 1
-        
-        # Cleanup
-        Path(file_path).unlink(missing_ok=True)
-        temp_dir.rmdir()
-        
-        # Final response
-        await status_msg.edit(
-            f"✅ **Batch Import Complete!**\n\n"
-            f"📊 **Stats:**\n"
-            f"• Files processed: {files_processed}\n"
-            f"• Total links read: {total_links}\n"
-            f"• Added to DB: {total_added}\n"
-            f"• Duplicates skipped: {total_duplicates}\n"
-            f"• Total in DB: {get_links_count()}"
-        )
-        
-    except json.JSONDecodeError:
-        await status_msg.edit("❌ Invalid JSON in one or more files!")
-    except Exception as e:
-        await status_msg.edit(f"❌ Error: {format_exc(e)}")
-
-
-# === VIEW DB STATS ===
-@Client.on_message(filters.command("dbstats", prefix) & filters.me)
-async def view_db_stats(client: Client, message: Message):
-    """View all links stored in DB"""
-    links = get_all_links()
-    count = len(links)
-    
-    text = f"📦 **TeraBox Links DB Stats**\n\n"
-    text += f"Total Links Stored: <code>{count}</code>\n"
-    
-    if count > 0:
-        text += f"\n✅ Database is populated"
-    else:
-        text += f"\n⚠️ Database is empty"
-    
-    await message.edit(text)
-
-
-# === EXPORT DB TO FILE ===
-@Client.on_message(filters.command("exportdb", prefix) & filters.me)
-async def export_db_to_file(client: Client, message: Message):
-    """Export all links from DB to JSON file"""
-    status_msg = await message.edit("📤 Exporting links from DB...")
-    
-    try:
-        links = get_all_links()
-        
-        if not links:
-            return await status_msg.edit("⚠️ No links in DB to export!")
-        
-        # Save to file
-        output_file = Path("terabox_all_links.json")
-        async with aiofiles.open(output_file, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(links, ensure_ascii=False, indent=2))
-        
-        # Send file
-        await client.send_document(
-            chat_id=message.chat.id,
-            document=str(output_file),
-            caption=f"✅ Exported {len(links)} TeraBox links from DB"
-        )
-        
-        await status_msg.delete()
-        output_file.unlink(missing_ok=True)
-        
-    except Exception as e:
-        await status_msg.edit(f"❌ Error: {format_exc(e)}")
-
-
-# === CLEAR DB ===
-@Client.on_message(filters.command("cleardb", prefix) & filters.me)
-async def clear_all_links(client: Client, message: Message):
-    """Clear all links from DB"""
-    clear_all_links_db()
-    await message.edit("🧹 Cleared all links from DB!")
-
-
-# === ORIGINAL TERABOX COMMANDS ===
-@Client.on_message(filters.command("autoterabox", prefix) & filters.me)
-async def toggle_autoterabox(client: Client, message: Message):
-    state = toggle_terabox()
-    await message.edit(f"{'✅' if state else '❌'} <b>Auto TeraBox Forward</b> {'enabled' if state else 'disabled'}.")
-
-@Client.on_message(filters.command("settb", prefix) & filters.me)
-async def set_tbox_target(client: Client, message: Message):
-    if len(message.command) < 2:
-        return await message.edit(f"Usage: <code>{prefix}settb [chat_id]</code>")
-    
-    try:
-        chat_id = int(message.command[1])
-        set_target_chat(chat_id)
-        await message.edit(f"✅ Set TeraBox target to <code>{chat_id}</code>")
-    except ValueError:
-        await message.edit("❌ Invalid chat ID. Must be a number.")
-
-@Client.on_message(filters.command("addtb", prefix) & filters.me)
-async def add_tbox_source(client: Client, message: Message):
-    if len(message.command) < 2:
-        return await message.edit(f"Usage: <code>{prefix}addtb [chat_id]</code>")
-    
-    try:
-        chat_id = int(message.command[1])
-        add_source(chat_id)
-        await message.edit(f"✅ Added TeraBox source <code>{chat_id}</code>")
-    except ValueError:
-        await message.edit("❌ Invalid chat ID. Must be a number.")
-
-@Client.on_message(filters.command("deltb", prefix) & filters.me)
-async def del_tbox_source(client: Client, message: Message):
-    if len(message.command) < 2:
-        return await message.edit(f"Usage: <code>{prefix}deltb [chat_id]</code>")
-    
-    try:
-        chat_id = int(message.command[1])
-        remove_source(chat_id)
-        await message.edit(f"🗑 Removed TeraBox source <code>{chat_id}</code>")
-    except ValueError:
-        await message.edit("❌ Invalid chat ID. Must be a number.")
-
-@Client.on_message(filters.command("listtb", prefix) & filters.me)
-async def list_tbox_sources(client: Client, message: Message):
-    cfg = get_terabox_config()
-    status = "✅ Enabled" if cfg.get("enabled") else "❌ Disabled"
-    text = f"<b>📦 TeraBox Auto-Forward</b>\n\n<b>Status:</b> {status}\n"
-    text += f"<b>Target:</b> <code>{cfg.get('target')}</code>\n\n<b>Sources:</b>\n"
-    if not cfg["sources"]:
-        text += "• None"
-    else:
-        text += "\n".join(f"• <code>{x}</code>" for x in cfg["sources"])
-    text += f"\n\n<b>Seen Links:</b> {len(cfg.get('seen_links', []))}"
-    await message.edit(text)
-
-@Client.on_message(filters.command("cleartbdb", prefix) & filters.me)
-async def clear_tb_db_cmd(client: Client, message: Message):
-    clear_terabox_db()
-    await message.edit("🧹 Cleared TeraBox forwarded link database!")
-
-# === AUTO FORWARD ===
-@Client.on_message(~filters.me)
-async def terabox_auto_forward(client: Client, message: Message):
-    if not is_terabox_enabled():
-        return
-
-    sources = get_sources()
-    target = get_target_chat()
-    if not sources or not target:
-        return
-
-    if message.chat.id not in sources:
-        return
-
-    text = message.text or message.caption
-    if not text:
-        return
-
-    links = extract_terabox_links(text)
-    if not links:
-        return
-
-    new_links = [link for link in links if record_link(link)]
-    if not new_links:
-        return
-
-    link_text = "\n".join(new_links)
-
-    try:
-        if getattr(message, "media", None):
-            await message.copy(int(target), caption=link_text)
-        else:
-            await client.send_message(int(target), link_text)
-        await asyncio.sleep(2.5)
-    except Exception as e:
-        print(f"[Terabox AutoForward] Error: {e}")
-
-
-
-import os
-import time
-import asyncio
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from utils.misc import modules_help, prefix
-from utils.scripts import import_library
-
-aiohttp = import_library("aiohttp")
-aiofiles = import_library("aiofiles")
-
-
-
-
-async def fetch_terabox_info(session, url):
-    api_url = f"https://terabox.itxarshman.workers.dev/api?url={url}"
-    async with session.get(api_url) as response:
-        if response.status == 200:
-            return await response.json()
-        return None
-
-
-async def download_file_optimized(session, url, file_path, chunk_size=1024*1024):
-    async with session.get(url) as response:
-        if response.status == 200:
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded = 0
-            start_time = time.time()
-
-            async with aiofiles.open(file_path, 'wb') as f:
-                async for chunk in response.content.iter_chunked(chunk_size):
-                    await f.write(chunk)
-                    downloaded += len(chunk)
-
-            elapsed_time = time.time() - start_time
-            speed_mbps = (downloaded / (1024 * 1024)) / elapsed_time if elapsed_time > 0 else 0
-            return True, speed_mbps, downloaded
-        return False, 0, 0
-
-
-@Client.on_message(filters.command("tbdl", prefix) & filters.me)
-async def terabox_download(client: Client, message: Message):
-    if len(message.command) < 2:
-        await message.edit("<b>Usage:</b> <code>.tbdl [terabox_url]</code>")
-        return
-
-    url = message.command[1]
-    status_msg = await message.edit("<b>Fetching file info...</b>")
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            data = await fetch_terabox_info(session, url)
-
-            if not data or data.get("count", 0) == 0:
-                await status_msg.edit("<b>Failed to fetch file info from API</b>")
-                return
-
-            links = data.get("links", [])
-            if not links:
-                await status_msg.edit("<b>No downloadable files found</b>")
-                return
-
-            file_info = links[0]
-            file_name = file_info.get("name", "terabox_file")
-            file_size_mb = file_info.get("size_mb", 0)
-            download_url = file_info.get("direct_url")
-
-            await status_msg.edit(
-                f"<b>File:</b> <code>{file_name}</code>\n"
-                f"<b>Size:</b> <code>{file_size_mb} MB</code>\n"
-                f"<b>Downloading...</b>"
-            )
-
-            temp_file = f"/tmp/{file_name}"
-
-            success, speed, downloaded_bytes = await download_file_optimized(
-                session, download_url, temp_file
-            )
-
-            if not success:
-                await status_msg.edit("<b>Download failed</b>")
-                return
-
-            await status_msg.edit(
-                f"<b>File:</b> <code>{file_name}</code>\n"
-                f"<b>Size:</b> <code>{file_size_mb} MB</code>\n"
-                f"<b>Speed:</b> <code>{speed:.2f} MB/s</code>\n"
-                f"<b>Uploading to Telegram...</b>"
-            )
-
-            category = file_info.get("category", "1")
-            thumb = file_info.get("thumb")
-
-            if category == "1":
-                await client.send_video(
-                    message.chat.id,
-                    video=temp_file,
-                    reply_to_message_id=message.reply_to_message.id if message.reply_to_message else None
-                )
-            else:
-                await client.send_document(
-                    message.chat.id,
-                    document=temp_file,
-                    reply_to_message_id=message.reply_to_message.id if message.reply_to_message else None
-                )
-
-            await status_msg.delete()
-
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-
-    except Exception as e:
-        await status_msg.edit(f"<b>Error:</b> <code>{str(e)}</code>")
-
-
-from asyncio import Semaphore, gather, create_task
-
-MAX_PARALLEL = 20 
+MAX_PARALLEL = 25  # limit to 10 downloads at once
 
 
 async def download_and_upload(session, client, link, chat_id, semaphore, output_dir: Path):
@@ -1168,13 +603,13 @@ async def download_and_upload(session, client, link, chat_id, semaphore, output_
                     await client.send_video(
                         chat_id, 
                         video=str(file_path),
-                        
+
                     )
                 else:
                     await client.send_document(
                         chat_id, 
                         document=str(file_path),
-                        
+
                     )
             except Exception as upload_error:
                 # If upload fails, keep file and report error
@@ -1207,42 +642,127 @@ async def download_and_upload(session, client, link, chat_id, semaphore, output_
             return {"url": link, "status": f"⚠️ Error: {str(e)}"}
 
 
+async def extract_links_from_message(message: Message) -> list:
+    """
+    Extract TeraBox links from various message sources:
+    - Text messages
+    - Captions (photo, video, document)
+    - Forwarded messages
+    - Replied messages
+    Returns list of unique links found
+    """
+    links = []
+    
+    # Check direct text
+    if message.text:
+        links.extend(extract_terabox_links(message.text))
+    
+    # Check caption (for photos, videos, documents)
+    if message.caption:
+        links.extend(extract_terabox_links(message.caption))
+    
+    # Check forwarded message
+    if message.forward_from_message_id and message.forward_from_chat:
+        try:
+            fwd_msg = await client.get_messages(
+                message.forward_from_chat.id,
+                message.forward_from_message_id
+            )
+            if fwd_msg.text:
+                links.extend(extract_terabox_links(fwd_msg.text))
+            if fwd_msg.caption:
+                links.extend(extract_terabox_links(fwd_msg.caption))
+        except:
+            pass
+    
+    # Check replied message
+    if message.reply_to_message:
+        reply_msg = message.reply_to_message
+        if reply_msg.text:
+            links.extend(extract_terabox_links(reply_msg.text))
+        if reply_msg.caption:
+            links.extend(extract_terabox_links(reply_msg.caption))
+    
+    # Remove duplicates while preserving order
+    unique_links = []
+    seen = set()
+    for link in links:
+        normalized = normalize_link(link)
+        if normalized not in seen:
+            seen.add(normalized)
+            unique_links.append(link)
+    
+    return unique_links
+
+
 @Client.on_message(filters.command("bulktbdl", prefix) & filters.me)
 async def batch_terabox_download(client: Client, message: Message):
     """
-    📦 Batch TeraBox Downloader
-    Usage: Reply to a JSON file with .bulktbdl
-    Downloads all links in parallel (max 10) and uploads automatically.
+    📦 Multi-Source Batch TeraBox Downloader
+    
+    Usage modes:
+    1. Reply to a JSON file: .bulktbdl
+    2. Reply to message with links in text/caption: .bulktbdl
+    3. Reply to forwarded/quoted message: .bulktbdl
+    
+    Downloads all links in parallel (max MAX_PARALLEL) and uploads automatically.
     """
-    status_msg = await message.edit("📂 Reading links from JSON file...")
+    status_msg = await message.edit("📂 Extracting links from source...")
 
     try:
-        if not message.reply_to_message or not message.reply_to_message.document:
-            return await status_msg.edit("❌ Reply to a JSON file containing links!")
+        links = []
+        
+        # Mode 1: JSON file
+        if message.reply_to_message and message.reply_to_message.document:
+            replied_msg = message.reply_to_message
+            
+            # Check if it's a JSON file
+            if replied_msg.document.file_name.endswith('.json'):
+                await status_msg.edit("📥 Downloading JSON file...")
+                
+                temp_dir = Path("temp_batch_dl")
+                temp_dir.mkdir(exist_ok=True)
+                
+                json_file_path = await client.download_media(
+                    replied_msg.document,
+                    file_name=temp_dir / replied_msg.document.file_name
+                )
 
-        # === Download JSON file ===
-        temp_dir = Path("temp_batch_dl")
-        temp_dir.mkdir(exist_ok=True)
-        json_file_path = await client.download_media(
-            message.reply_to_message.document,
-            file_name=temp_dir / message.reply_to_message.document.file_name
-        )
+                await status_msg.edit("📖 Parsing JSON file...")
+                
+                async with aiofiles.open(json_file_path, "r", encoding="utf-8") as f:
+                    data = json.loads(await f.read())
 
-        # === Parse JSON ===
-        async with aiofiles.open(json_file_path, "r", encoding="utf-8") as f:
-            data = json.loads(await f.read())
-
-        if isinstance(data, dict) and "links" in data:
-            links = data["links"]
-        elif isinstance(data, list):
-            links = data
+                if isinstance(data, dict) and "links" in data:
+                    links = data["links"]
+                elif isinstance(data, list):
+                    links = data
+                else:
+                    return await status_msg.edit("⚠️ Invalid JSON — must be list or {links: []}")
+                
+                Path(json_file_path).unlink(missing_ok=True)
+            else:
+                # Not a JSON file, try extracting links from document caption
+                links = await extract_links_from_message(replied_msg)
+        
+        # Mode 2 & 3: Extract from replied message (text/caption/forwarded)
+        elif message.reply_to_message:
+            await status_msg.edit("🔍 Extracting links from message...")
+            links = await extract_links_from_message(message.reply_to_message)
+        
         else:
-            return await status_msg.edit("⚠️ Invalid JSON — must be list or {links: []}")
+            return await status_msg.edit(
+                f"❌ No source found!\n\n"
+                f"Usage modes:\n"
+                f"• Reply to JSON file with links\n"
+                f"• Reply to message with link text/caption\n"
+                f"• Reply to forwarded message with links"
+            )
 
         if not links:
-            return await status_msg.edit("⚠️ No links found in file!")
+            return await status_msg.edit("⚠️ No TeraBox links found in source!")
 
-        await status_msg.edit(f"📦 Found {len(links)} links — downloading (max {MAX_PARALLEL} at once)...")
+        await status_msg.edit(f"📦 Found {len(links)} unique links — downloading (max {MAX_PARALLEL} at once)...")
 
         semaphore = Semaphore(MAX_PARALLEL)
         output_dir = Path("terabox_batch_downloads")
@@ -1251,11 +771,19 @@ async def batch_terabox_download(client: Client, message: Message):
 
         async with aiohttp.ClientSession() as session:
             async def worker(link):
-                result = await download_and_upload(session, client, link, message.chat.id, semaphore, output_dir)
+                result = await download_and_upload(
+                    session, client, link, 
+                    message.chat.id, semaphore, output_dir
+                )
                 results.append(result)
                 done = len(results)
-                if done % 1 == 0 or done == len(links):
-                    await status_msg.edit(f"⬇️ Progress: {done}/{len(links)} completed...")
+                
+                # Update progress every 5 downloads or at the end
+                if done % 2 == 0 or done == len(links):
+                    await status_msg.edit(
+                        f"⬇️ Progress: {done}/{len(links)} completed...\n"
+                        f"⏱️ Processing..."
+                    )
                 return result
 
             tasks = [create_task(worker(link)) for link in links]
@@ -1273,7 +801,7 @@ async def batch_terabox_download(client: Client, message: Message):
             f"• Failed: <code>{failed}</code>"
         )
 
-        # Save summary JSON
+        # Save detailed results to JSON
         result_file = output_dir / "batch_results.json"
         async with aiofiles.open(result_file, "w", encoding="utf-8") as f:
             await f.write(json.dumps(results, ensure_ascii=False, indent=2))
@@ -1286,231 +814,10 @@ async def batch_terabox_download(client: Client, message: Message):
 
         await status_msg.edit(summary)
 
-        # Cleanup
-        Path(json_file_path).unlink(missing_ok=True)
-
+    except json.JSONDecodeError:
+        await status_msg.edit("❌ Invalid JSON format in file!")
     except Exception as e:
         await status_msg.edit(f"❌ Error: <code>{format_exc(e)}</code>")
-
-###########################
-
-def get_download_target():
-    """Get the target channel for auto-downloads"""
-    return get_terabox_config().get("download_target")
-
-def set_download_target(chat_id):
-    """Set target channel for auto-downloads"""
-    cfg = get_terabox_config()
-    cfg["download_target"] = chat_id
-    save_terabox_config(cfg)
-
-def is_auto_download_enabled():
-    """Check if auto download is enabled"""
-    return get_terabox_config().get("auto_download_enabled", False)
-
-def toggle_auto_download():
-    """Toggle auto download feature"""
-    cfg = get_terabox_config()
-    cfg["auto_download_enabled"] = not cfg.get("auto_download_enabled", False)
-    save_terabox_config(cfg)
-    return cfg["auto_download_enabled"]
-
-def get_download_source():
-    """Get the source channel to monitor for downloads"""
-    return get_terabox_config().get("download_source")
-
-def set_download_source(chat_id):
-    """Set source channel to monitor for auto-downloads"""
-    cfg = get_terabox_config()
-    cfg["download_source"] = chat_id
-    save_terabox_config(cfg)
-
-
-# === NEW COMMANDS FOR AUTO DOWNLOAD ===
-
-@Client.on_message(filters.command("settbdl", prefix) & filters.me)
-async def set_tbdl_target(client: Client, message: Message):
-    """
-    Set target channel for auto-downloading TeraBox links
-    Usage: .settbdl [chat_id]
-    """
-    if len(message.command) < 2:
-        return await message.edit(f"Usage: <code>{prefix}settbdl [chat_id]</code>")
-    
-    try:
-        chat_id = int(message.command[1])
-        set_download_target(chat_id)
-        await message.edit(f"✅ Set TeraBox auto-download target to <code>{chat_id}</code>")
-    except ValueError:
-        await message.edit("❌ Invalid chat ID. Must be a number.")
-
-
-@Client.on_message(filters.command("addtbdl", prefix) & filters.me)
-async def set_tbdl_source(client: Client, message: Message):
-    """
-    Set source channel to monitor for TeraBox links to auto-download
-    Usage: .addtbdl [chat_id]
-    """
-    if len(message.command) < 2:
-        return await message.edit(f"Usage: <code>{prefix}settbdlsrc [chat_id]</code>")
-    
-    try:
-        chat_id = int(message.command[1])
-        set_download_source(chat_id)
-        await message.edit(f"✅ Set TeraBox auto-download source to <code>{chat_id}</code>")
-    except ValueError:
-        await message.edit("❌ Invalid chat ID. Must be a number.")
-
-
-@Client.on_message(filters.command("autotbdl", prefix) & filters.me)
-async def toggle_auto_tbdl(client: Client, message: Message):
-    """
-    Toggle automatic TeraBox downloading
-    Usage: .autotbdl
-    """
-    state = toggle_auto_download()
-    await message.edit(
-        f"{'✅' if state else '❌'} <b>Auto TeraBox Download</b> {'enabled' if state else 'disabled'}.\n\n"
-        f"💡 Links from source channel will be automatically downloaded and uploaded to target channel."
-    )
-
-
-@Client.on_message(filters.command("tbdlstatus", prefix) & filters.me)
-async def show_tbdl_status(client: Client, message: Message):
-    """
-    Show auto-download configuration status
-    Usage: .tbdlstatus
-    """
-    cfg = get_terabox_config()
-    enabled = cfg.get("auto_download_enabled", False)
-    source = cfg.get("download_source")
-    target = cfg.get("download_target")
-    
-    status = "✅ Enabled" if enabled else "❌ Disabled"
-    
-    text = (
-        f"<b>🤖 TeraBox Auto-Download Status</b>\n\n"
-        f"<b>Status:</b> {status}\n"
-        f"<b>Source Channel:</b> <code>{source if source else 'Not set'}</code>\n"
-        f"<b>Target Channel:</b> <code>{target if target else 'Not set'}</code>\n\n"
-        f"💡 <b>How it works:</b>\n"
-        f"• Monitors source channel for TeraBox links\n"
-        f"• Auto-downloads files\n"
-        f"• Uploads to target channel\n"
-    )
-    
-    await message.edit(text)
-
-
-# === AUTO DOWNLOAD HANDLER ===
-
-@Client.on_message(~filters.me)
-async def terabox_auto_download_handler(client: Client, message: Message):
-    """
-    Automatically download and upload TeraBox links from monitored channel
-    """
-    # Check if auto-download is enabled
-    if not is_auto_download_enabled():
-        return
-    
-    # Get config
-    source = get_download_source()
-    target = get_download_target()
-    
-    # Validate configuration
-    if not source or not target:
-        return
-    
-    # Check if message is from the source channel
-    if message.chat.id != source:
-        return
-    
-    # Extract text from message
-    text = message.text or message.caption
-    if not text:
-        return
-    
-    # Find TeraBox links
-    links = extract_terabox_links(text)
-    if not links:
-        return
-    
-    # Process each link
-    for link in links:
-        try:
-            async with aiohttp.ClientSession() as session:
-                # Fetch file info
-                data = await fetch_terabox_info(session, link)
-                
-                if not data or data.get("count", 0) == 0:
-                    continue
-                
-                file_links = data.get("links", [])
-                if not file_links:
-                    continue
-                
-                file_info = file_links[0]
-                file_name = file_info.get("name", "terabox_file")
-                file_size_mb = file_info.get("size_mb", 0)
-                download_url = file_info.get("direct_url")
-                category = file_info.get("category", "1")
-                
-                # Download file
-                temp_file = f"/tmp/{file_name}"
-                success, speed, downloaded_bytes = await download_file_optimized(
-                    session, download_url, temp_file
-                )
-                
-                if not success:
-                    continue
-                
-                # Upload to target channel (without caption)
-                if category == "1":
-                    await client.send_video(
-                        int(target),
-                        video=temp_file
-                    )
-                else:
-                    await client.send_document(
-                        int(target),
-                        document=temp_file
-                    )
-                
-                # Cleanup
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                
-                # Small delay to avoid rate limiting
-                await asyncio.sleep(3)
-                
-        except Exception as e:
-            print(f"[TeraBox AutoDL] Error processing {link}: {e}")
-            continue
-
-############################
-
-
-
-# === HELP MENU ===
-modules_help["terabox"] = {
-    "importlinks": "Import links from JSON file to DB (reply to file)",
-    "batchimport": "Batch import multiple files to DB (reply to message)",
-    "dbstats": "View total links in DB",
-    "exportdb": "Export all links from DB to JSON file",
-    "cleardb": "Clear all links from DB",
-    "autoterabox": "Toggle automatic TeraBox link forwarding",
-    "settb [chat_id]": "Set target chat for TeraBox forwards",
-    "addtb [chat_id]": "Add a source channel for TeraBox links",
-    "deltb [chat_id]": "Remove a source channel",
-    "listtb": "Show TeraBox forwarding config",
-    "cleartbdb": "Clear seen links (allow re-forwarding)",
-    "tbdl [url]": "Download videos/files from TeraBox with optimized server-side downloading",
-    "settbdl [chat_id]": "Set target channel for auto-downloading TeraBox links",
-    "addtbdl [chat_id]": "Set source channel to monitor for TeraBox links",
-    "autotbdl": "Toggle automatic TeraBox download & upload",
-    "tbdlstatus": "Show auto-download configuration status",
-}
-
 ###########################
 
 def get_download_target():
