@@ -642,127 +642,42 @@ async def download_and_upload(session, client, link, chat_id, semaphore, output_
             return {"url": link, "status": f"⚠️ Error: {str(e)}"}
 
 
-async def extract_links_from_message(message: Message) -> list:
-    """
-    Extract TeraBox links from various message sources:
-    - Text messages
-    - Captions (photo, video, document)
-    - Forwarded messages
-    - Replied messages
-    Returns list of unique links found
-    """
-    links = []
-    
-    # Check direct text
-    if message.text:
-        links.extend(extract_terabox_links(message.text))
-    
-    # Check caption (for photos, videos, documents)
-    if message.caption:
-        links.extend(extract_terabox_links(message.caption))
-    
-    # Check forwarded message
-    if message.forward_from_message_id and message.forward_from_chat:
-        try:
-            fwd_msg = await client.get_messages(
-                message.forward_from_chat.id,
-                message.forward_from_message_id
-            )
-            if fwd_msg.text:
-                links.extend(extract_terabox_links(fwd_msg.text))
-            if fwd_msg.caption:
-                links.extend(extract_terabox_links(fwd_msg.caption))
-        except:
-            pass
-    
-    # Check replied message
-    if message.reply_to_message:
-        reply_msg = message.reply_to_message
-        if reply_msg.text:
-            links.extend(extract_terabox_links(reply_msg.text))
-        if reply_msg.caption:
-            links.extend(extract_terabox_links(reply_msg.caption))
-    
-    # Remove duplicates while preserving order
-    unique_links = []
-    seen = set()
-    for link in links:
-        normalized = normalize_link(link)
-        if normalized not in seen:
-            seen.add(normalized)
-            unique_links.append(link)
-    
-    return unique_links
-
-
 @Client.on_message(filters.command("bulktbdl", prefix) & filters.me)
 async def batch_terabox_download(client: Client, message: Message):
     """
-    📦 Multi-Source Batch TeraBox Downloader
-    
-    Usage modes:
-    1. Reply to a JSON file: .bulktbdl
-    2. Reply to message with links in text/caption: .bulktbdl
-    3. Reply to forwarded/quoted message: .bulktbdl
-    
-    Downloads all links in parallel (max MAX_PARALLEL) and uploads automatically.
+    📦 Batch TeraBox Downloader
+    Usage: Reply to a JSON file with .bulktbdl
+    Downloads all links in parallel (max 10) and uploads automatically.
     """
-    status_msg = await message.edit("📂 Extracting links from source...")
+    status_msg = await message.edit("📂 Reading links from JSON file...")
 
     try:
-        links = []
-        
-        # Mode 1: JSON file
-        if message.reply_to_message and message.reply_to_message.document:
-            replied_msg = message.reply_to_message
-            
-            # Check if it's a JSON file
-            if replied_msg.document.file_name.endswith('.json'):
-                await status_msg.edit("📥 Downloading JSON file...")
-                
-                temp_dir = Path("temp_batch_dl")
-                temp_dir.mkdir(exist_ok=True)
-                
-                json_file_path = await client.download_media(
-                    replied_msg.document,
-                    file_name=temp_dir / replied_msg.document.file_name
-                )
+        if not message.reply_to_message or not message.reply_to_message.document:
+            return await status_msg.edit("❌ Reply to a JSON file containing links!")
 
-                await status_msg.edit("📖 Parsing JSON file...")
-                
-                async with aiofiles.open(json_file_path, "r", encoding="utf-8") as f:
-                    data = json.loads(await f.read())
+        # === Download JSON file ===
+        temp_dir = Path("temp_batch_dl")
+        temp_dir.mkdir(exist_ok=True)
+        json_file_path = await client.download_media(
+            message.reply_to_message.document,
+            file_name=temp_dir / message.reply_to_message.document.file_name
+        )
 
-                if isinstance(data, dict) and "links" in data:
-                    links = data["links"]
-                elif isinstance(data, list):
-                    links = data
-                else:
-                    return await status_msg.edit("⚠️ Invalid JSON — must be list or {links: []}")
-                
-                Path(json_file_path).unlink(missing_ok=True)
-            else:
-                # Not a JSON file, try extracting links from document caption
-                links = await extract_links_from_message(replied_msg)
-        
-        # Mode 2 & 3: Extract from replied message (text/caption/forwarded)
-        elif message.reply_to_message:
-            await status_msg.edit("🔍 Extracting links from message...")
-            links = await extract_links_from_message(message.reply_to_message)
-        
+        # === Parse JSON ===
+        async with aiofiles.open(json_file_path, "r", encoding="utf-8") as f:
+            data = json.loads(await f.read())
+
+        if isinstance(data, dict) and "links" in data:
+            links = data["links"]
+        elif isinstance(data, list):
+            links = data
         else:
-            return await status_msg.edit(
-                f"❌ No source found!\n\n"
-                f"Usage modes:\n"
-                f"• Reply to JSON file with links\n"
-                f"• Reply to message with link text/caption\n"
-                f"• Reply to forwarded message with links"
-            )
+            return await status_msg.edit("⚠️ Invalid JSON — must be list or {links: []}")
 
         if not links:
-            return await status_msg.edit("⚠️ No TeraBox links found in source!")
+            return await status_msg.edit("⚠️ No links found in file!")
 
-        await status_msg.edit(f"📦 Found {len(links)} unique links — downloading (max {MAX_PARALLEL} at once)...")
+        await status_msg.edit(f"📦 Found {len(links)} links — downloading (max {MAX_PARALLEL} at once)...")
 
         semaphore = Semaphore(MAX_PARALLEL)
         output_dir = Path("terabox_batch_downloads")
@@ -771,19 +686,11 @@ async def batch_terabox_download(client: Client, message: Message):
 
         async with aiohttp.ClientSession() as session:
             async def worker(link):
-                result = await download_and_upload(
-                    session, client, link, 
-                    message.chat.id, semaphore, output_dir
-                )
+                result = await download_and_upload(session, client, link, message.chat.id, semaphore, output_dir)
                 results.append(result)
                 done = len(results)
-                
-                # Update progress every 5 downloads or at the end
-                if done % 2 == 0 or done == len(links):
-                    await status_msg.edit(
-                        f"⬇️ Progress: {done}/{len(links)} completed...\n"
-                        f"⏱️ Processing..."
-                    )
+                if done % 3 == 0 or done == len(links):
+                    await status_msg.edit(f"⬇️ Progress: {done}/{len(links)} completed...")
                 return result
 
             tasks = [create_task(worker(link)) for link in links]
@@ -801,7 +708,7 @@ async def batch_terabox_download(client: Client, message: Message):
             f"• Failed: <code>{failed}</code>"
         )
 
-        # Save detailed results to JSON
+        # Save summary JSON
         result_file = output_dir / "batch_results.json"
         async with aiofiles.open(result_file, "w", encoding="utf-8") as f:
             await f.write(json.dumps(results, ensure_ascii=False, indent=2))
@@ -814,10 +721,12 @@ async def batch_terabox_download(client: Client, message: Message):
 
         await status_msg.edit(summary)
 
-    except json.JSONDecodeError:
-        await status_msg.edit("❌ Invalid JSON format in file!")
+        # Cleanup
+        Path(json_file_path).unlink(missing_ok=True)
+
     except Exception as e:
         await status_msg.edit(f"❌ Error: <code>{format_exc(e)}</code>")
+
 ###########################
 
 def get_download_target():
