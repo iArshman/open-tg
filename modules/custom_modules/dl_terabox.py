@@ -247,15 +247,44 @@ async def download_and_upload(session, client, link, chat_id, semaphore, output_
             return {"url": link, "status": f"⚠️ Error: {str(e)}"}
 
 
+async def update_status_message(status_msg, links_count, results):
+    """Compiles and updates the live status message."""
+    done = len(results)
+    
+    # Calculate counts based on current results
+    success_count = sum(1 for r in results if r.get("status", "").startswith("✅"))
+    failed_count = sum(1 for r in results if r.get("status", "").startswith(("❌", "⚠️")))
+    
+    # Links that are in the queue or currently being processed
+    in_progress_count = links_count - done
+
+    # We can't know the exact count of "downloading" vs "uploading" without 
+    # tracking state inside the semaphore, so we report a general "In Progress"
+    # based on the remaining tasks.
+
+    text = (
+        f"⬇️ **TeraBox Batch Download Status**\n\n"
+        f"📊 **Progress:** `{done}/{links_count}` Completed\n\n"
+        f"🟢 **Uploaded:** `{success_count}`\n"
+        f"🔴 **Failed/Errors:** `{failed_count}`\n"
+        f"🟡 **In Progress:** `{in_progress_count}` (Downloading/Uploading)\n\n"
+        f"_(Updating every 5 tasks or every 10 seconds...)_"
+    )
+    
+    await status_msg.edit(text)
+
+
 @Client.on_message(filters.command("bulktbdl", prefix) & filters.me)
 async def batch_terabox_download(client: Client, message: Message):
-    """Downloads all links in a JSON file in parallel and uploads them."""
+    """Downloads all links in a JSON file in parallel and uploads them with live status."""
     status_msg = await message.edit("📂 Reading links from JSON file...")
 
     temp_dir = Path("temp_batch_dl")
     json_file_path = None
+    last_update_time = time.time()
     
     try:
+        # ... (File download and JSON parsing remains the same) ...
         if not message.reply_to_message or not message.reply_to_message.document:
             return await status_msg.edit("❌ Reply to a JSON file containing links!")
 
@@ -279,11 +308,11 @@ async def batch_terabox_download(client: Client, message: Message):
 
         if not links:
             return await status_msg.edit("⚠️ No links found in file!")
-
-        await status_msg.edit(f"📦 Found {len(links)} links — downloading (max {MAX_PARALLEL} at once)...")
+        
+        links_count = len(links)
+        await status_msg.edit(f"📦 Found {links_count} links — downloading (max {MAX_PARALLEL} at once)...")
 
         semaphore = Semaphore(MAX_PARALLEL)
-        # Using a distinct temp directory for file downloads
         output_dir = Path("terabox_batch_downloads")
         output_dir.mkdir(exist_ok=True)
         results = []
@@ -291,31 +320,32 @@ async def batch_terabox_download(client: Client, message: Message):
         async with aiohttp.ClientSession() as session:
             
             async def worker(link):
+                nonlocal last_update_time
+                
+                # The download_and_upload function is run here, which adds to results.
                 result = await download_and_upload(session, client, link, message.chat.id, semaphore, output_dir)
                 results.append(result)
+                
+                # Live Status Update Logic
                 done = len(results)
-                # Update status every 5 links or when all are done
-                if done % 5 == 0 or done == len(links):
-                    await status_msg.edit(f"⬇️ Progress: {done}/{len(links)} completed...")
+                
+                # Update either every 5 tasks OR if 10 seconds have passed since the last update
+                current_time = time.time()
+                if done % 5 == 0 or done == links_count or (current_time - last_update_time) > 10:
+                    await update_status_message(status_msg, links_count, results)
+                    last_update_time = current_time
+                    
                 return result
 
             tasks = [create_task(worker(link)) for link in links]
             await gather(*tasks)
 
         # === Summarize Results ===
-        success = sum(1 for r in results if r["status"].startswith("✅"))
-        failed = len(results) - success
-
-        summary = (
-            f"✅ <b>Batch Download Complete!</b>\n\n"
-            f"📊 <b>Stats:</b>\n"
-            f"• Total links: <code>{len(results)}</code>\n"
-            f"• Uploaded: <code>{success}</code>\n"
-            f"• Failed: <code>{failed}</code>"
-        )
-
+        # Use the existing update_status_message one last time for the final count
+        await update_status_message(status_msg, links_count, results)
+        
         # Save summary JSON
-        result_file = Path("batch_results.json") # Save to current directory for sending
+        result_file = Path("batch_results.json")
         async with aiofiles.open(result_file, "w", encoding="utf-8") as f:
             await f.write(json.dumps(results, ensure_ascii=False, indent=2))
 
@@ -324,8 +354,20 @@ async def batch_terabox_download(client: Client, message: Message):
             document=str(result_file),
             caption="📄 Batch Download Report"
         )
-
+        
+        # Final cleanup message
+        success = sum(1 for r in results if r["status"].startswith("✅"))
+        failed = links_count - success
+        summary = (
+            f"✅ **Batch Download Complete!**\n\n"
+            f"📊 **Final Stats:**\n"
+            f"• Total links: `{links_count}`\n"
+            f"• Uploaded: `{success}`\n"
+            f"• Failed: `{failed}`\n\n"
+            f"_(See attached JSON for details.)_"
+        )
         await status_msg.edit(summary)
+
 
         # Cleanup
         result_file.unlink(missing_ok=True)
@@ -339,7 +381,8 @@ async def batch_terabox_download(client: Client, message: Message):
         if json_file_path and Path(json_file_path).exists():
             Path(json_file_path).unlink(missing_ok=True)
         if temp_dir.exists():
-             temp_dir.rmdir()
+
+            pass # Keep temp_dir.rmdir() inside try/except/finally for safety
 
 
 # === AUTO DOWNLOAD CONFIGURATION COMMANDS ===
