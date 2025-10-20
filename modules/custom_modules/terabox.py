@@ -563,7 +563,7 @@ async def terabox_download(client: Client, message: Message):
 
 from asyncio import Semaphore, gather, create_task
 
-MAX_PARALLEL = 10  # limit to 10 downloads at once
+MAX_PARALLEL = 20  # limit to 10 downloads at once
 
 
 async def download_and_upload(session, client, link, chat_id, semaphore, output_dir: Path):
