@@ -511,7 +511,7 @@ async def terabox_auto_forward(client: Client, message: Message):
 
 
 # === HELP MENU ===
-modules_help["terabox"] = {
+modules_help["tbscraper"] = {
     "importlinks": "Import links from JSON file to DB (reply to file)",
     "batchimport": "Batch import multiple files to DB (reply to message)",
     "dbstats": "View total links in DB",
