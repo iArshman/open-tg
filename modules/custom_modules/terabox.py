@@ -614,85 +614,147 @@ async def download_and_upload(session, client, link, chat_id, semaphore, output_
 @Client.on_message(filters.command("bulktbdl", prefix) & filters.me)
 async def batch_terabox_download(client: Client, message: Message):
     """
-    📦 Batch TeraBox Downloader
-    Usage: Reply to a JSON file with .bulktbdl
+    📦 Enhanced Batch TeraBox Downloader
+    Usage: 
+    1. Reply to JSON file: .bulktbdl
+    2. Reply to message with links: .bulktbdl
+    3. Direct command with links: .bulktbdl [url1] [url2] ...
+    4. Auto-extract from DB: .bulktbdl --fromdb
+    
     Downloads all links in parallel (max 10) and uploads automatically.
     """
-    status_msg = await message.edit("📂 Reading links from JSON file...")
-
+    status_msg = await message.edit("🔍 Detecting link source...")
+    
     try:
-        if not message.reply_to_message or not message.reply_to_message.document:
-            return await status_msg.edit("❌ Reply to a JSON file containing links!")
-
-        # === Download JSON file ===
-        temp_dir = Path("temp_batch_dl")
-        temp_dir.mkdir(exist_ok=True)
-        json_file_path = await client.download_media(
-            message.reply_to_message.document,
-            file_name=temp_dir / message.reply_to_message.document.file_name
-        )
-
-        # === Parse JSON ===
-        async with aiofiles.open(json_file_path, "r", encoding="utf-8") as f:
-            data = json.loads(await f.read())
-
-        if isinstance(data, dict) and "links" in data:
-            links = data["links"]
-        elif isinstance(data, list):
-            links = data
+        links = []
+        
+        # === METHOD 1: From DB ===
+        if len(message.command) > 1 and message.command[1] == "--fromdb":
+            links = get_all_links()
+            if not links:
+                return await status_msg.edit("❌ No links found in DB! Use `.importlinks` first.")
+            await status_msg.edit(f"📦 Loaded {len(links)} links from DB...")
+        
+        # === METHOD 2: Reply to JSON file ===
+        elif message.reply_to_message and message.reply_to_message.document:
+            doc = message.reply_to_message.document
+            if doc.file_name.lower().endswith('.json'):
+                await status_msg.edit("📂 Reading links from JSON file...")
+                
+                temp_dir = Path("temp_batch_dl")
+                temp_dir.mkdir(exist_ok=True)
+                json_file_path = await client.download_media(
+                    doc,
+                    file_name=temp_dir / doc.file_name
+                )
+                
+                async with aiofiles.open(json_file_path, "r", encoding="utf-8") as f:
+                    data = json.loads(await f.read())
+                
+                if isinstance(data, dict) and "links" in data:
+                    links = data["links"]
+                elif isinstance(data, list):
+                    links = data
+                else:
+                    return await status_msg.edit("⚠️ Invalid JSON — must be list or {links: []}")
+                
+                Path(json_file_path).unlink(missing_ok=True)
+            else:
+                return await status_msg.edit("❌ Please reply to a JSON file!")
+        
+        # === METHOD 3: Reply to message with TeraBox links ===
+        elif message.reply_to_message:
+            text = message.reply_to_message.text or message.reply_to_message.caption
+            if text:
+                links = extract_terabox_links(text)
+                if not links:
+                    return await status_msg.edit("❌ No TeraBox links found in replied message!")
+                await status_msg.edit(f"🔗 Extracted {len(links)} TeraBox links from message...")
+            else:
+                return await status_msg.edit("❌ Replied message has no text!")
+        
+        # === METHOD 4: Direct command arguments ===
+        elif len(message.command) > 1:
+            # Join all arguments and extract links
+            full_text = " ".join(message.command[1:])
+            links = extract_terabox_links(full_text)
+            if not links:
+                return await status_msg.edit("❌ No valid TeraBox links found in command!")
+            await status_msg.edit(f"🔗 Found {len(links)} TeraBox links...")
+        
+        # === No valid input ===
         else:
-            return await status_msg.edit("⚠️ Invalid JSON — must be list or {links: []}")
-
+            usage = (
+                f"<b>📦 Bulk TeraBox Download Usage:</b>\n\n"
+                f"<b>Method 1:</b> Reply to JSON file\n"
+                f"<code>{prefix}bulktbdl</code>\n\n"
+                f"<b>Method 2:</b> Reply to message with links\n"
+                f"<code>{prefix}bulktbdl</code>\n\n"
+                f"<b>Method 3:</b> Direct links\n"
+                f"<code>{prefix}bulktbdl [url1] [url2] ...</code>\n\n"
+                f"<b>Method 4:</b> From DB\n"
+                f"<code>{prefix}bulktbdl --fromdb</code>"
+            )
+            return await status_msg.edit(usage)
+        
+        # === Validate links ===
         if not links:
-            return await status_msg.edit("⚠️ No links found in file!")
-
-        await status_msg.edit(f"📦 Found {len(links)} links — downloading (max {MAX_PARALLEL} at once)...")
-
+            return await status_msg.edit("⚠️ No links found!")
+        
+        # Remove duplicates while preserving order
+        links = list(dict.fromkeys(links))
+        
+        await status_msg.edit(
+            f"📦 Processing {len(links)} unique links...\n"
+            f"⚡ Max {MAX_PARALLEL} parallel downloads"
+        )
+        
+        # === Download & Upload ===
         semaphore = Semaphore(MAX_PARALLEL)
         output_dir = Path("terabox_batch_downloads")
         output_dir.mkdir(exist_ok=True)
         results = []
-
+        
         async with aiohttp.ClientSession() as session:
-            async def worker(link):
-                result = await download_and_upload(session, client, link, message.chat.id, semaphore, output_dir)
+            async def worker(link, index):
+                result = await download_and_upload(
+                    session, client, link, message.chat.id, semaphore, output_dir
+                )
                 results.append(result)
                 done = len(results)
+                
+                # Update progress every 3 files or on completion
                 if done % 3 == 0 or done == len(links):
-                    await status_msg.edit(f"⬇️ Progress: {done}/{len(links)} completed...")
+                    progress = (done / len(links)) * 100
+                    await status_msg.edit(
+                        f"⬇️ <b>Progress:</b> {done}/{len(links)} ({progress:.1f}%)\n"
+                        f"✅ Completed • ❌ Failed: {sum(1 for r in results if r['status'].startswith('❌'))}"
+                    )
                 return result
-
-            tasks = [create_task(worker(link)) for link in links]
+            
+            tasks = [create_task(worker(link, i)) for i, link in enumerate(links)]
             await gather(*tasks)
-
+        
         # === Summarize Results ===
         success = sum(1 for r in results if r["status"].startswith("✅"))
         failed = len(results) - success
-
+        
+        # Calculate total size
+        total_size = sum(r.get("size", 0) for r in results if r["status"].startswith("✅"))
+        
         summary = (
             f"✅ <b>Batch Download Complete!</b>\n\n"
             f"📊 <b>Stats:</b>\n"
             f"• Total links: <code>{len(results)}</code>\n"
-            f"• Uploaded: <code>{success}</code>\n"
-            f"• Failed: <code>{failed}</code>"
+            f"• ✅ Uploaded: <code>{success}</code>\n"
+            f"• ❌ Failed: <code>{failed}</code>\n"
+            f"• 📦 Total size: <code>{total_size:.2f} MB</code>"
         )
-
-        # Save summary JSON
-        result_file = output_dir / "batch_results.json"
-        async with aiofiles.open(result_file, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(results, ensure_ascii=False, indent=2))
-
-        await client.send_document(
-            message.chat.id,
-            document=str(result_file),
-            caption="📄 Batch Download Report"
-        )
-
+        
         await status_msg.edit(summary)
-
-        # Cleanup
-        Path(json_file_path).unlink(missing_ok=True)
-
+        
+    except json.JSONDecodeError:
+        await status_msg.edit("❌ Invalid JSON file format!")
     except Exception as e:
         await status_msg.edit(f"❌ Error: <code>{format_exc(e)}</code>")
 
