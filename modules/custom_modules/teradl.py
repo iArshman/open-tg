@@ -537,7 +537,7 @@ async def terabox_auto_download_handler(client: Client, message: Message):
             continue
 
 # === HELP MENU ENTRY ===
-modules_help["terabox"] = {
+modules_help["teradl"] = {
     "tbdl [url]": "Download videos/files from TeraBox (single link)",
     "bulktbdl": "Batch download links from JSON file (reply to file)",
     "settbdl [chat_id]": "Set target channel for auto-downloading TeraBox links",
