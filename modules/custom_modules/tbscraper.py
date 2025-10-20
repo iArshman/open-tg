@@ -307,68 +307,7 @@ async def view_db_stats(client: Client, message: Message):
     
     await message.edit(text)
 
-@Client.on_message(filters.command("exporttb", prefix) & filters.me)
-async def scrapetb_send(client: Client, message: Message):
-    """
-    Fast scrape TeraBox links from a source chat, save to JSON, and send the file.
-    Usage: .scrapetb_send [source_chat_id] [limit|all]
-    """
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            return await message.edit(
-                f"<b>Usage:</b> <code>{prefix}scrapetb_send [source_chat_id] [limit|all]</code>"
-            )
 
-        source_id = int(args[1])
-        limit_arg = args[2] if len(args) > 2 else "1000"
-        limit = None if limit_arg.lower() == "all" else int(limit_arg)
-
-        links = []
-        msg_count = 0
-
-        status_msg = await message.edit(f"🔍 Fetching messages from <code>{source_id}</code>...")
-
-        # Fetch messages
-        async for msg in client.get_chat_history(source_id, limit=limit):
-            msg_count += 1
-            text = msg.text or msg.caption
-            if text:
-                msg_links = extract_terabox_links(text)
-                if msg_links:
-                    links.extend(msg_links)
-
-            # Update progress every 50 messages
-            if msg_count % 50 == 0:
-                try:
-                    await status_msg.edit(f"📤 Fetched {msg_count} messages | Links found: {len(links)}")
-                except Exception:
-                    pass
-
-        if not links:
-            return await message.edit(f"⚠️ No TeraBox links found in {msg_count} messages.")
-
-        # Save to JSON async
-        save_path = Path("terabox_links.json")
-        async with aiofiles.open(save_path, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(links, ensure_ascii=False, indent=2))
-
-        # Send the file (correct way for Pyrogram)
-        await client.send_document(
-            chat_id=message.chat.id,
-            document=str(save_path),  # ✅ Just pass the path as string
-            caption=f"✅ Scraped {len(links)} TeraBox links from {msg_count} messages."
-        )
-
-        # Delete the status message after sending file
-        await status_msg.delete()
-        
-        # Clean up the file
-        save_path.unlink(missing_ok=True)
-
-    except Exception as e:
-        await message.edit(format_exc(e))
-        
 # === EXPORT DB TO FILE ===
 @Client.on_message(filters.command("exportdb", prefix) & filters.me)
 async def export_db_to_file(client: Client, message: Message):
@@ -505,13 +444,73 @@ async def terabox_auto_forward(client: Client, message: Message):
     except Exception as e:
         print(f"[Terabox AutoForward] Error: {e}")
 
+@Client.on_message(filters.command("exporttb", prefix) & filters.me)
+async def scrapetb_send(client: Client, message: Message):
+    """
+    Fast scrape TeraBox links from a source chat, save to JSON, and send the file.
+    Usage: .scrapetb_send [source_chat_id] [limit|all]
+    """
+    try:
+        args = message.text.split()
+        if len(args) < 2:
+            return await message.edit(
+                f"<b>Usage:</b> <code>{prefix}scrapetb_send [source_chat_id] [limit|all]</code>"
+            )
 
+        source_id = int(args[1])
+        limit_arg = args[2] if len(args) > 2 else "1000"
+        limit = None if limit_arg.lower() == "all" else int(limit_arg)
+
+        links = []
+        msg_count = 0
+
+        status_msg = await message.edit(f"🔍 Fetching messages from <code>{source_id}</code>...")
+
+        # Fetch messages
+        async for msg in client.get_chat_history(source_id, limit=limit):
+            msg_count += 1
+            text = msg.text or msg.caption
+            if text:
+                msg_links = extract_terabox_links(text)
+                if msg_links:
+                    links.extend(msg_links)
+
+            # Update progress every 50 messages
+            if msg_count % 50 == 0:
+                try:
+                    await status_msg.edit(f"📤 Fetched {msg_count} messages | Links found: {len(links)}")
+                except Exception:
+                    pass
+
+        if not links:
+            return await message.edit(f"⚠️ No TeraBox links found in {msg_count} messages.")
+
+        # Save to JSON async
+        save_path = Path("terabox_links.json")
+        async with aiofiles.open(save_path, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(links, ensure_ascii=False, indent=2))
+
+        # Send the file (correct way for Pyrogram)
+        await client.send_document(
+            chat_id=message.chat.id,
+            document=str(save_path),  # ✅ Just pass the path as string
+            caption=f"✅ Scraped {len(links)} TeraBox links from {msg_count} messages."
+        )
+
+        # Delete the status message after sending file
+        await status_msg.delete()
+        
+        # Clean up the file
+        save_path.unlink(missing_ok=True)
+
+    except Exception as e:
+        await message.edit(format_exc(e))
 ############################
 
 
 
 # === HELP MENU ===
-modules_help["tbscraper"] = {
+modules_help["terabox"] = {
     "importlinks": "Import links from JSON file to DB (reply to file)",
     "batchimport": "Batch import multiple files to DB (reply to message)",
     "dbstats": "View total links in DB",
