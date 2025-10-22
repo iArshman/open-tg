@@ -348,7 +348,7 @@ async def clear_all_links(client: Client, message: Message):
 
 
 # === ORIGINAL TERABOX COMMANDS ===
-@Client.on_message(filters.command("autoterabox", prefix) & filters.me)
+@Client.on_message(filters.command("autoterabox", prefix) & filters.me group=20)
 async def toggle_autoterabox(client: Client, message: Message):
     state = toggle_terabox()
     await message.edit(f"{'✅' if state else '❌'} <b>Auto TeraBox Forward</b> {'enabled' if state else 'disabled'}.")
@@ -444,7 +444,7 @@ async def terabox_auto_forward(client: Client, message: Message):
     except Exception as e:
         print(f"[Terabox AutoForward] Error: {e}")
 
-@Client.on_message(filters.command("exporttb", prefix) & filters.me)
+@Client.on_message(filters.command("exporttb", prefix) & filters.me group=21)
 async def scrapetb_send(client: Client, message: Message):
     """
     Fast scrape TeraBox links from a source chat, save to JSON, and send the file.
