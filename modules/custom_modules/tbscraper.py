@@ -348,7 +348,7 @@ async def clear_all_links(client: Client, message: Message):
 
 
 # === ORIGINAL TERABOX COMMANDS ===
-@Client.on_message(filters.command("autoterabox", prefix) & filters.me group=20)
+@Client.on_message(filters.command("autoterabox", prefix) & filters.me, group=20)
 async def toggle_autoterabox(client: Client, message: Message):
     state = toggle_terabox()
     await message.edit(f"{'✅' if state else '❌'} <b>Auto TeraBox Forward</b> {'enabled' if state else 'disabled'}.")
