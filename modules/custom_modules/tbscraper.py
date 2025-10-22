@@ -444,7 +444,7 @@ async def terabox_auto_forward(client: Client, message: Message):
     except Exception as e:
         print(f"[Terabox AutoForward] Error: {e}")
 
-@Client.on_message(filters.command("exporttb", prefix) & filters.me group=21)
+@Client.on_message(filters.command("exporttb", prefix) & filters.me, group=21)
 async def scrapetb_send(client: Client, message: Message):
     """
     Fast scrape TeraBox links from a source chat, save to JSON, and send the file.
