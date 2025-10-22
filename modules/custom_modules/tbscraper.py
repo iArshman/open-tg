@@ -505,6 +505,171 @@ async def scrapetb_send(client: Client, message: Message):
 
     except Exception as e:
         await message.edit(format_exc(e))
+
+
+# === BULK FORWARD (media + links only) ===
+@Client.on_message(filters.command("bulktb", prefix) & filters.me)
+async def bulk_terabox(client: Client, message: Message):
+    """
+    Usage: .bulktb [source_id] [limit|all] [delay]
+    Example: .bulktb -1001234567890 100 2
+             .bulktb -1001234567890 all 2
+    """
+    status_msg = None
+    try:
+        args = message.text.split()
+        if len(args) < 2:
+            return await message.edit(
+                f"<b>Usage:</b> <code>{prefix}bulktb [source_chat_id] [limit|all] [delay]</code>\n"
+                f"<b>Example:</b> <code>{prefix}bulktb -1001234567890 100 3</code>\n"
+                f"<b>Example:</b> <code>{prefix}bulktb -1001234567890 all 2</code>"
+            )
+
+        source_id = int(args[1])
+        limit_arg = args[2] if len(args) > 2 else "50"
+        delay = float(args[3]) if len(args) > 3 else 2.5
+
+        if limit_arg.lower() == "all":
+            limit = None
+        else:
+            limit = int(limit_arg)
+
+        target_id = get_target_chat()
+        if not target_id:
+            return await message.edit("❌ No target chat set! Use <code>.settb [chat_id]</code> first.")
+
+        status_msg = await message.edit(f"🔍 Fetching messages from <code>{source_id}</code>...")
+
+        # --- Fetch messages upfront (with limit to prevent memory issues) ---
+        fetched_messages = []
+        fetch_count = 0
+        max_fetch = limit if limit else 10000  # Cap at 10k for "all" to prevent freezing
+        
+        async for msg in client.get_chat_history(source_id, limit=limit):
+            fetch_count += 1
+            text = msg.text or msg.caption
+            if text and extract_terabox_links(text):
+                fetched_messages.append(msg)
+            
+            # Update every 100 messages during fetch
+            if fetch_count % 100 == 0:
+                try:
+                    await status_msg.edit(f"🔍 Fetched {fetch_count} messages... Found {len(fetched_messages)} with links")
+                except Exception:
+                    pass
+            
+            # Safety limit
+            if fetch_count >= max_fetch:
+                break
+
+        total_messages = len(fetched_messages)
+        total_links = sum(len(extract_terabox_links(m.text or m.caption)) for m in fetched_messages)
+
+        if total_messages == 0:
+            return await message.edit("⚠️ No messages with TeraBox links found.")
+
+        # Reverse to process oldest → newest
+        fetched_messages.reverse()
+
+        # --- Load seen links in memory (set) ---
+        cfg = get_terabox_config()
+        seen_links = {normalize_link(l) for l in cfg.get("seen_links", [])}
+
+        sent_messages = 0
+        skipped_messages = 0
+        forwarded_links = 0
+        start_time = time.time()
+
+        status_msg = await message.edit(
+            f"📦 Found {total_messages} messages with {total_links} links.\nStarting forward..."
+        )
+
+        # --- Process messages sequentially ---
+        for idx, msg in enumerate(fetched_messages, 1):
+            try:
+                text = msg.text or msg.caption
+                links = extract_terabox_links(text)
+
+                if not links:
+                    skipped_messages += 1
+                    continue
+
+                # Check which links are new
+                new_links = []
+                for link in links:
+                    normalized = normalize_link(link)
+                    if normalized not in seen_links:
+                        seen_links.add(normalized)
+                        new_links.append(link)
+
+                if not new_links:
+                    skipped_messages += 1
+                    continue
+
+                link_text = "\n".join(new_links)
+
+                # Forward message
+                if getattr(msg, "media", None):
+                    await msg.copy(int(target_id), caption=link_text)
+                else:
+                    await client.send_message(int(target_id), link_text)
+
+                sent_messages += 1
+                forwarded_links += len(new_links)
+
+            except Exception as e:
+                print(f"[BulkTBox] Failed msg {msg.id}: {e}")
+                skipped_messages += 1
+
+            # Update progress every 20 messages
+            if idx % 20 == 0 or idx == total_messages:
+                elapsed = int(time.time() - start_time)
+                eta = int((total_messages - idx) * delay)
+                progress = (
+                    f"📦 Processing {idx}/{total_messages} | Sent: {sent_messages} | "
+                    f"Skipped: {skipped_messages} | Links forwarded: {forwarded_links} | "
+                    f"Elapsed: {elapsed}s | ETA: {eta}s"
+                )
+                try:
+                    await status_msg.edit(progress)
+                except Exception:
+                    pass
+
+            await asyncio.sleep(delay)
+
+        # --- Batch write seen links to DB ---
+        # Simply store normalized links as a list (much faster)
+        cfg["seen_links"] = list(seen_links)
+        save_terabox_config(cfg)
+
+        total_time = int(time.time() - start_time)
+        await status_msg.edit(
+            f"✅ Bulk forward completed!\n\n"
+            f"Source: <code>{source_id}</code>\n"
+            f"Target: <code>{target_id}</code>\n"
+            f"Total messages: {total_messages}\n"
+            f"Messages forwarded: {sent_messages}\n"
+            f"Messages skipped: {skipped_messages}\n"
+            f"Total links forwarded: {forwarded_links}\n"
+            f"Total time: {total_time}s"
+        )
+
+    except ValueError as e:
+        error_msg = f"❌ Invalid input: {str(e)}"
+        if status_msg:
+            await status_msg.edit(error_msg)
+        else:
+            await message.edit(error_msg)
+    except Exception as e:
+        error_msg = f"❌ Error in bulk forward:\n<code>{format_exc(e)}</code>"
+        if status_msg:
+            try:
+                await status_msg.edit(error_msg)
+            except:
+                await message.reply(error_msg)
+        else:
+            await message.edit(error_msg)
+
 ############################
 
 
