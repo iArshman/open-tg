@@ -15,9 +15,10 @@ from modules.custom_modules.elevenlabs import generate_elevenlabs_audio
 import time
 import pymongo
 from utils import config
+from pyrogram.errors import FloodWait # Added FloodWait import for cleaner error handling
 
 # Initialize Gemini AI - UPDATED IMPORT
-# The import_library function must now load 'google.genai' from the 'google-genai' package.
+# Changed from "google.generativeai" to "google.genai"
 genai = import_library("google.genai", "google-genai")
 safety_settings = [
     {"category": cat, "threshold": "BLOCK_NONE"}
@@ -89,7 +90,7 @@ async def send_typing_action(client, chat_id, user_message):
     await client.send_chat_action(chat_id=chat_id, action=enums.ChatAction.TYPING)
     await asyncio.sleep(min(len(user_message) / 10, 5))
 
-# --- UPDATED GEMINI API CALL FUNCTION ---
+# --- UPDATED & CORRECTED GEMINI API CALL FUNCTION ---
 async def _call_gemini_api(client: Client, input_data, user_id: int, model_name: str, chat_history_list: list, is_image_input: bool = False):
     gemini_keys = get_gemini_keys()
     if not gemini_keys:
@@ -106,19 +107,18 @@ async def _call_gemini_api(client: Client, input_data, user_id: int, model_name:
                 current_key_index = 0
                 db.set(collection, "current_key_index", current_key_index)
 
-            # FIX 1: Retrieve key and initialize the new Client
+            # Retrieve key string
             current_key_obj = gemini_keys[current_key_index]
             current_key = current_key_obj["key"] if isinstance(current_key_obj, dict) else current_key_obj
             
-            # The new SDK uses a central Client object
+            # 1. Initialize the new Client
             gemini_client = genai.Client(api_key=current_key) 
 
-            # FIX 2: Get the model via the client's models service
-            # This replaces genai.GenerativeModel(model_name)
+            # 2. FIX: Get the model via the client's models service. 
+            # We use the explicit `models.get(model_name)` call as determined by the new SDK structure.
             model = gemini_client.models.get(model_name)
             
-            # FIX 3: Call generate_content on the model object and pass safety settings
-            # The safety_settings list is passed directly to the method
+            # 3. Call generate_content on the model object and pass safety settings
             response = model.generate_content(
                 input_data, 
                 stream=False,
@@ -130,13 +130,18 @@ async def _call_gemini_api(client: Client, input_data, user_id: int, model_name:
 
         except Exception as e:
             error_str = str(e).lower()
-            from pyrogram.errors import FloodWait
-
-            if isinstance(e, FloodWait) or "429" in error_str or "invalid" in error_str or "blocked" in error_str:
-                await client.send_message("me", f"🔄 Key {current_key_index + 1} failed or rate limited, switching...")
+            
+            # We rely on the imported FloodWait
+            if isinstance(e, FloodWait):
+                await client.send_message("me", f"⏳ Rate limited, switching key...")
+                await asyncio.sleep(e.value + 1)
                 current_key_index = (current_key_index + 1) % len(gemini_keys)
                 db.set(collection, "current_key_index", current_key_index)
-                await asyncio.sleep(4 if "429" in error_str else e.value + 1)
+            elif "429" in error_str or "invalid" in error_str or "blocked" in error_str:
+                await client.send_message("me", f"🔄 Key {current_key_index + 1} failed, switching...")
+                current_key_index = (current_key_index + 1) % len(gemini_keys)
+                db.set(collection, "current_key_index", current_key_index)
+                await asyncio.sleep(4)
             else:
                 if (attempt + 1) % retries_per_key == 0 and (current_key_index == initial_key_index or len(gemini_keys) == 1):
                     raise e
@@ -148,8 +153,6 @@ async def _call_gemini_api(client: Client, input_data, user_id: int, model_name:
     await client.send_message("me", "❌ All API keys failed.")
     raise Exception("All Gemini API keys failed.")
     
-# ... (get_api_keys_db, get_gemini_keys, save_gemini_keys, add_gemini_key remain unchanged) ...
-
 def get_api_keys_db():
     """Get connection to separate API Keys database"""
     client = pymongo.MongoClient(config.db_url)
@@ -163,7 +166,9 @@ def get_gemini_keys():
         if result is None:
             api_db["gemini_keys"].insert_one({"type": "keys", "keys": []})
             return []
-        return result.get("keys", [])
+        # Crucial for compatibility: ensure we return the structure expected by the caller
+        # The gchat _call_gemini_api expects a list of dictionaries: [{"key": "...", "name": None}, ...]
+        return result.get("keys", []) 
     except Exception as e:
         print(f"Error getting gemini keys: {e}")
         return []
@@ -194,7 +199,6 @@ def add_gemini_key(new_key):
 
 # --- UPDATED FILE UPLOAD FUNCTION ---
 async def upload_file_to_gemini(file_path, file_type):
-    # Retrieve key and initialize the new Client
     gemini_keys = get_gemini_keys()
     if not gemini_keys:
         raise ValueError("No Gemini API keys configured.")
@@ -218,8 +222,6 @@ async def upload_file_to_gemini(file_path, file_type):
         raise ValueError(f"{file_type.capitalize()} failed to process.")
         
     return uploaded_file
-
-# ... (handle_voice_message, load_user_message_queue, save_user_message_to_db, clear_user_message_queue remain unchanged) ...
 
 async def handle_voice_message(client, chat_id, bot_response, message_id):
     global elevenlabs_enabled
@@ -325,7 +327,7 @@ async def process_messages(client, message, user_id, user_name):
                 user_message_queues[user_id].clear()
                 clear_user_message_queue(user_id)
                 active_users.discard(user_id)
-                return
+                return  
             # --- END FIX ---
             
             delay = random.choice([6, 10, 12])
@@ -413,6 +415,7 @@ async def process_messages(client, message, user_id, user_name):
 @Client.on_message(filters.private & ~filters.me & ~filters.bot, group=2)
 async def handle_files(client: Client, message: Message):
     file_path = None
+    uploaded_file = None # Define outside try to ensure clean-up in finally block
     try:
         user_id, user_name = message.from_user.id, message.from_user.first_name or "User"
 
@@ -440,6 +443,7 @@ async def handle_files(client: Client, message: Message):
         chat_history_list = get_chat_history(user_id, bot_role, caption, user_name)
 
         if message.photo:
+            
             if not hasattr(client, "image_buffer"):
                 client.image_buffer = {}
                 client.image_timers = {}
@@ -494,7 +498,6 @@ async def handle_files(client: Client, message: Message):
                 return
 
         file_type = None
-        uploaded_file = None
         if message.video or message.video_note:
             file_type, file_path = "video", await client.download_media(message.video or message.video_note)
         elif message.audio or message.voice:
@@ -509,7 +512,6 @@ async def handle_files(client: Client, message: Message):
             try:
                 # Calls the refactored upload_file_to_gemini
                 uploaded_file = await upload_file_to_gemini(file_path, file_type)
-                
                 prompt_text = f"User has sent a {file_type}." + (f" Caption: {caption}" if caption else "")
                 full_prompt = build_gemini_prompt(bot_role, chat_history_list, prompt_text)
 
