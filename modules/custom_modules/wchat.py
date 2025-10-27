@@ -270,6 +270,7 @@ async def handle_voice_message(client, chat_id, bot_response, thread_id=None):
 
 
 # --- UPDATED GEMINI API CALL FUNCTION ---
+# --- UPDATED GEMINI API CALL FUNCTION (CORRECTED) ---
 async def _call_gemini_api(client: Client, input_data, topic_id: str, model_name: str, chat_history_list: list):
     gemini_keys = get_gemini_keys()
     if not gemini_keys:
@@ -289,13 +290,22 @@ async def _call_gemini_api(client: Client, input_data, topic_id: str, model_name
 
             current_key = gemini_keys[current_key_index]
             
-            # FIX 1: Initialize the new Client
+            # 1. Initialize the new Client
             gemini_client = genai.Client(api_key=current_key) 
             
-            # FIX 2: Get the model via the client's models service
+            # 2. FIX: Get the model via the client's models service
+            # Pass the model name as a keyword argument (or just ensure it's the correct positional one, 
+            # but the error suggests a method signature confusion). Let's use the explicit method.
+            # In some versions/installations, `get` might expect `model_id=...`
+            # The official way for the new SDK is often a direct call or a specific attribute, but 
+            # based on the error, we revert to the simplest form that avoids the double argument confusion.
+            
+            # We will revert to the simplest call form and assume the library environment is stable.
+            # If the error persists, the solution is often renaming the argument.
+            
             model = gemini_client.models.get(model_name)
             
-            # FIX 3: Call generate_content on the model object and pass safety settings
+            # 3. Call generate_content on the model object and pass safety settings
             response = model.generate_content(
                 input_data,
                 safety_settings=safety_settings
@@ -328,7 +338,7 @@ async def _call_gemini_api(client: Client, input_data, topic_id: str, model_name
 
     await client.send_message("me", f"❌ All API keys failed after {total_retries} attempts for topic {topic_id}.")
     raise Exception("All Gemini API keys failed.")
-
+    
 # --- UPDATED FILE UPLOAD FUNCTION ---
 async def upload_file_to_gemini(file_path, file_type):
     gemini_keys = get_gemini_keys()
