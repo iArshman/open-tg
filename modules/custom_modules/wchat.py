@@ -18,8 +18,9 @@ from pyrogram.errors import FloodWait
 # --- DATABASE CONSTANTS ---
 COLLECTION_NAME = "custom.wchat" 
 
-# Initialize Gemini AI
-genai = import_library("google.generativeai", "google-generativeai")
+# Initialize Gemini AI - UPDATED IMPORT
+# The import_library function must now load 'google.genai' from the 'google-genai' package.
+genai = import_library("google.genai", "google-genai")
 safety_settings = [
     {"category": cat, "threshold": "BLOCK_NONE"}
     for cat in [
@@ -142,6 +143,7 @@ def get_gemini_keys():
         if result is None:
             api_db["gemini_keys"].insert_one({"type": "keys", "keys": []})
             return []
+        # Ensure we only return the key string
         return [entry.get("key") for entry in result.get("keys", []) if entry.get("key")]
     except Exception as e:
         print(f"Error getting gemini keys: {e}")
@@ -267,6 +269,7 @@ async def handle_voice_message(client, chat_id, bot_response, thread_id=None):
         return True
 
 
+# --- UPDATED GEMINI API CALL FUNCTION ---
 async def _call_gemini_api(client: Client, input_data, topic_id: str, model_name: str, chat_history_list: list):
     gemini_keys = get_gemini_keys()
     if not gemini_keys:
@@ -286,11 +289,17 @@ async def _call_gemini_api(client: Client, input_data, topic_id: str, model_name
 
             current_key = gemini_keys[current_key_index]
             
-            genai.configure(api_key=current_key)
-            model = genai.GenerativeModel(model_name)
-            model.safety_settings = safety_settings
+            # FIX 1: Initialize the new Client
+            gemini_client = genai.Client(api_key=current_key) 
             
-            response = model.generate_content(input_data)
+            # FIX 2: Get the model via the client's models service
+            model = gemini_client.models.get(model_name)
+            
+            # FIX 3: Call generate_content on the model object and pass safety settings
+            response = model.generate_content(
+                input_data,
+                safety_settings=safety_settings
+            )
             bot_response = response.text.strip()
             
             return bot_response
@@ -320,13 +329,29 @@ async def _call_gemini_api(client: Client, input_data, topic_id: str, model_name
     await client.send_message("me", f"❌ All API keys failed after {total_retries} attempts for topic {topic_id}.")
     raise Exception("All Gemini API keys failed.")
 
+# --- UPDATED FILE UPLOAD FUNCTION ---
 async def upload_file_to_gemini(file_path, file_type):
-    uploaded_file = genai.upload_file(file_path)
+    gemini_keys = get_gemini_keys()
+    if not gemini_keys:
+        raise ValueError("No Gemini API keys configured.")
+    
+    current_key_index = get_global_config_field("key_index", 0)
+    current_key = gemini_keys[current_key_index]
+    
+    # Initialize the new Client
+    client = genai.Client(api_key=current_key) 
+
+    # FIX 4: Use client.files.upload
+    uploaded_file = client.files.upload(file=file_path)
+    
     while uploaded_file.state.name == "PROCESSING":
         await asyncio.sleep(10)
-        uploaded_file = genai.get_file(uploaded_file.name)
+        # FIX 5: Use client.files.get
+        uploaded_file = client.files.get(uploaded_file.name)
+        
     if uploaded_file.state.name == "FAILED":
         raise ValueError(f"{file_type.capitalize()} failed to process.")
+        
     return uploaded_file
 
 def load_group_message_queue(topic_id):
@@ -430,6 +455,7 @@ async def process_group_messages(client, message, topic_id, user_name):
             max_length = 200
 
             try:
+                # Calls the refactored _call_gemini_api
                 bot_response = await _call_gemini_api(client, full_prompt, topic_id, model_to_use, chat_history_list)
                 
                 if len(bot_response) > max_length:
@@ -484,6 +510,7 @@ async def process_group_messages(client, message, topic_id, user_name):
 async def handle_files(client: Client, message: Message):
     file_path = None
     topic_id = None
+    uploaded_file = None # Define outside try to ensure clean-up in finally block
     try:
         group_id = str(message.chat.id)
         thread_id_str = str(message.message_thread_id) if message.message_thread_id else "0"
@@ -564,7 +591,9 @@ async def handle_files(client: Client, message: Message):
         if file_path and file_type:
             await asyncio.sleep(random.uniform(0.1, 0.5))
             try:
+                # Calls the refactored upload_file_to_gemini
                 uploaded_file = await upload_file_to_gemini(file_path, file_type)
+                
                 prompt_text = f"User has sent a {file_type}." + (f" Caption: {caption}" if caption else "")
                 
                 bot_role_file = get_effective_bot_role(group_id, topic_id)
@@ -581,6 +610,18 @@ async def handle_files(client: Client, message: Message):
     except Exception as e:
         await client.send_message("me", f"❌ An error occurred in group `handle_files` function for topic {topic_id}:\n\n{str(e)}")
     finally:
+        # Clean up uploaded file from Gemini's file service
+        if uploaded_file:
+            try:
+                current_key_index = get_global_config_field("key_index", 0)
+                current_key = get_gemini_keys()[current_key_index]
+                client = genai.Client(api_key=current_key) 
+                # Clean up: delete the file from the service
+                client.files.delete(name=uploaded_file.name)
+            except Exception as e_cleanup:
+                # Log the cleanup failure but don't stop the main process
+                print(f"Failed to delete uploaded Gemini file: {e_cleanup}")
+
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
