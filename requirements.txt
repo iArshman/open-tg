@@ -24,3 +24,4 @@ pytgcalls==3.0.0.dev24
 pytz
 mutagen
 google-genai
+motor
