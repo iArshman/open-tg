@@ -346,15 +346,36 @@ def is_key_available(api_key):
 
     now = time.time()
 
-    # RPM cooldown active
+    # 🚫 Invalid key permanently skipped
+    if data.get("status") == "invalid":
+        return False
+
+    # RPM cooldown
     if data.get("rpm_block_until", 0) > now:
         return False
 
-    # RPD exhausted active
+    # RPD exhausted
     if data.get("rpd_block_until", 0) > now:
         return False
 
     return True
+
+    
+def mark_key_invalid(api_key, key_index):
+    api_db = get_api_keys_db()
+    col = api_db["gemini_key_limits"]
+
+    now = time.time()
+
+    col.update_one(
+        {"key": api_key},
+        {"$set": {
+            "status": "invalid",
+            "invalid_time": now,
+            "invalid_index": key_index
+        }},
+        upsert=True
+    )
 
 
 
@@ -816,11 +837,17 @@ async def set_gemini_key(client: Client, message: Message):
         now = time.time()
 
         blocked_count = api_db["gemini_key_limits"].count_documents({
-            "$or": [
-                {"rpm_block_until": {"$gt": now}},
-                {"rpd_block_until": {"$gt": now}}
-            ]
-        })
+    "$or": [
+        {"rpm_block_until": {"$gt": now}},
+        {"rpd_block_until": {"$gt": now}}
+    ]
+})
+
+# ✅ Invalid Keys Count
+invalid_count = api_db["gemini_key_limits"].count_documents({
+    "status": "invalid"
+})
+
 
         # ================================
         # ADD KEY
@@ -915,12 +942,14 @@ async def set_gemini_key(client: Client, message: Message):
         # DEFAULT STATUS VIEW
         # ================================
         await message.edit_text(
-            f"🤖 **Gemini Key Manager**\n\n"
-            f"📌 Model: `{current_model}`\n"
-            f"🔑 Total Keys: `{total_keys}`\n"
-            f"➡️ Current Key: `{current_key_index+1 if total_keys else 0}`\n"
-            f"🚫 Blocked Keys: `{blocked_count}`\n\n"
-        )
+    f"🤖 **Gemini Key Manager**\n\n"
+    f"📌 Model: {current_model}\n"
+    f"🔑 Total Keys: {total_keys}\n"
+    f"➡️ Current Key: {current_key_index+1 if total_keys else 0}\n"
+    f"🚫 Blocked Keys: {blocked_count}\n"
+    f"❌ Invalid Keys: {invalid_count}\n\n"
+)
+
 
     except Exception as e:
         await message.edit_text(f"❌ Error in setgkey:\n\n{str(e)}")
