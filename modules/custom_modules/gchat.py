@@ -831,23 +831,21 @@ async def set_gemini_key(client: Client, message: Message):
         current_model = db.get(collection, "gmodel_name") or "Not Set"
 
         # ==========================================
-        # ✅ FAST BLOCKED COUNT (Single Mongo Query)
+        # ✅ FAST BLOCKED + INVALID COUNT
         # ==========================================
         api_db = get_api_keys_db()
         now = time.time()
 
         blocked_count = api_db["gemini_key_limits"].count_documents({
-    "$or": [
-        {"rpm_block_until": {"$gt": now}},
-        {"rpd_block_until": {"$gt": now}}
-    ]
-})
+            "$or": [
+                {"rpm_block_until": {"$gt": now}},
+                {"rpd_block_until": {"$gt": now}}
+            ]
+        })
 
-# ✅ Invalid Keys Count
-invalid_count = api_db["gemini_key_limits"].count_documents({
-    "status": "invalid"
-})
-
+        invalid_count = api_db["gemini_key_limits"].count_documents({
+            "status": "invalid"
+        })
 
         # ================================
         # ADD KEY
@@ -942,14 +940,13 @@ invalid_count = api_db["gemini_key_limits"].count_documents({
         # DEFAULT STATUS VIEW
         # ================================
         await message.edit_text(
-    f"🤖 **Gemini Key Manager**\n\n"
-    f"📌 Model: {current_model}\n"
-    f"🔑 Total Keys: {total_keys}\n"
-    f"➡️ Current Key: {current_key_index+1 if total_keys else 0}\n"
-    f"🚫 Blocked Keys: {blocked_count}\n"
-    f"❌ Invalid Keys: {invalid_count}\n\n"
-)
-
+            f"🤖 **Gemini Key Manager**\n\n"
+            f"📌 Model: `{current_model}`\n"
+            f"🔑 Total Keys: `{total_keys}`\n"
+            f"➡️ Current Key: `{current_key_index+1 if total_keys else 0}`\n"
+            f"🚫 Blocked Keys: `{blocked_count}`\n"
+            f"❌ Invalid Keys: `{invalid_count}`\n\n"
+        )
 
     except Exception as e:
         await message.edit_text(f"❌ Error in setgkey:\n\n{str(e)}")
