@@ -173,7 +173,7 @@ async def _call_gemini_api(
     total_retries = len(gemini_keys) * retries_per_key
 
     # ==========================================
-    # FIX: File/Image inputs must NOT rotate keys
+    # FIX: Image/File inputs must NOT rotate keys
     # ==========================================
     if is_image_input:
         gemini_keys = [gemini_keys[current_key_index]]
@@ -191,7 +191,6 @@ async def _call_gemini_api(
                 else current_key_obj
             )
 
-            # ✅ Key Index Number (1-based)
             key_number = current_key_index + 1
 
             # ================================
@@ -217,9 +216,26 @@ async def _call_gemini_api(
         except Exception as e:
             raw_error = str(e)
             error_str = raw_error.lower()
-
-            # ✅ Always know which key failed
             key_number = current_key_index + 1
+
+            # ==========================================
+            # ✅ INVALID KEY ERROR (400 API_KEY_INVALID)
+            # ==========================================
+            if "api_key_invalid" in error_str or "400" in error_str and "api key not found" in error_str:
+                await client.send_message(
+                    "me",
+                    f"🚫 INVALID API KEY → Key #{key_number} removed/skipped"
+                )
+
+                # Block this key for 24h
+                block_key_rpd(current_key)
+
+                # Rotate to next key
+                if not is_image_input:
+                    current_key_index = (current_key_index + 1) % len(gemini_keys)
+                    db.set(collection, "current_key_index", current_key_index)
+
+                continue
 
             # ================================
             # HANDLE QUOTA ERRORS (429)
@@ -235,7 +251,7 @@ async def _call_gemini_api(
                     await asyncio.sleep(60)
                     continue
 
-                # RPD LIMIT HIT → BLOCK KEY
+                # RPD LIMIT HIT
                 elif "GenerateRequestsPerDayPerProjectPerModel-FreeTier" in raw_error:
                     await client.send_message(
                         "me",
@@ -244,14 +260,13 @@ async def _call_gemini_api(
 
                     block_key_rpd(current_key)
 
-                    # Rotate key only for text mode
                     if not is_image_input:
                         current_key_index = (current_key_index + 1) % len(gemini_keys)
                         db.set(collection, "current_key_index", current_key_index)
 
                     continue
 
-                # UNKNOWN 429 ERROR
+                # UNKNOWN 429
                 else:
                     await client.send_message(
                         "me",
@@ -265,7 +280,7 @@ async def _call_gemini_api(
             if "403" in error_str and "file" in error_str:
                 await client.send_message(
                     "me",
-                    f"❌ FILE ACCESS ERROR on Key #{key_number}: Upload key mismatch prevented access."
+                    f"❌ FILE ACCESS ERROR on Key #{key_number}: Upload key mismatch."
                 )
                 raise e
 
