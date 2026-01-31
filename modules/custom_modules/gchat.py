@@ -172,9 +172,10 @@ async def _call_gemini_api(
     retries_per_key = 2
     total_retries = len(gemini_keys) * retries_per_key
 
-    # ==========================================
-    # FIX: Image/File inputs must NOT rotate keys
-    # ==========================================
+    # ✅ Prohibited retry counter (max 3 keys)
+    prohibited_tries = 0
+
+    # ✅ Image/File inputs must NOT rotate keys
     if is_image_input:
         gemini_keys = [gemini_keys[current_key_index]]
         current_key_index = 0
@@ -202,7 +203,6 @@ async def _call_gemini_api(
             # CONFIGURE GEMINI
             # ================================
             genai.configure(api_key=current_key)
-
             model = genai.GenerativeModel(model_name)
             model.safety_settings = safety_settings
 
@@ -210,8 +210,7 @@ async def _call_gemini_api(
             # CALL GEMINI API
             # ================================
             response = model.generate_content(input_data, stream=False)
-            bot_response = response.text.strip()
-            return bot_response
+            return response.text.strip()
 
         except Exception as e:
             raw_error = str(e)
@@ -219,31 +218,80 @@ async def _call_gemini_api(
             key_number = current_key_index + 1
 
             # ==========================================
-            # ✅ INVALID KEY ERROR (400 API_KEY_INVALID)
+            # ✅ PROHIBITED CONTENT (BLOCKED PROMPT)
+            # Try only 3 keys then STOP + ONE LOG
             # ==========================================
-            if "api_key_invalid" in error_str or "400" in error_str and "api key not found" in error_str:
-                await client.send_message(
-                    "me",
-                    f"🚫 INVALID API KEY → Key #{key_number} removed/skipped"
-                )
+            if (
+                "prohibited_content" in error_str
+                or "block_reason" in error_str
+                or "candidates is empty" in error_str
+            ):
+                prohibited_tries += 1
 
-                # Block this key for 24h
-                block_key_rpd(current_key)
-
-                # Rotate to next key
+                # Silent rotate
                 if not is_image_input:
                     current_key_index = (current_key_index + 1) % len(gemini_keys)
                     db.set(collection, "current_key_index", current_key_index)
 
+                # After 3 keys → ONE saved log only
+                if prohibited_tries >= 3:
+                    await client.send_message(
+                        "me",
+                        "🚫 Prompt BLOCKED (PROHIBITED_CONTENT) after 3 key retries."
+                    )
+                    raise e
+
                 continue
 
-            # ================================
-            # HANDLE QUOTA ERRORS (429)
-            # ================================
+            # ==========================================
+            # ✅ FILE ACCESS ERROR → NO ROTATION
+            # ==========================================
+            if "403" in error_str and "file" in error_str:
+                await client.send_message(
+                    "me",
+                    f"📁 FILE ACCESS ERROR on Key #{key_number} → NO ROTATION"
+                )
+                raise e
+
+            # ==========================================
+            # ✅ INVALID KEY (400)
+            # ==========================================
+            if "api_key_invalid" in error_str or "api key not found" in error_str:
+                await client.send_message(
+                    "me",
+                    f"🚫 INVALID KEY → Key #{key_number} marked invalid + rotated"
+                )
+
+                mark_key_invalid(current_key, key_number)
+
+                if not is_image_input:
+                    current_key_index = (current_key_index + 1) % len(gemini_keys)
+                    db.set(collection, "current_key_index", current_key_index)
+                continue
+
+            # ==========================================
+            # ✅ SUSPENDED KEY → ALSO INVALID
+            # ==========================================
+            if "consumer_suspended" in error_str:
+                await client.send_message(
+                    "me",
+                    f"🚫 SUSPENDED KEY → Key #{key_number} marked invalid + rotated"
+                )
+
+                mark_key_invalid(current_key, key_number)
+
+                if not is_image_input:
+                    current_key_index = (current_key_index + 1) % len(gemini_keys)
+                    db.set(collection, "current_key_index", current_key_index)
+                continue
+
+            # ==========================================
+            # ✅ QUOTA ERRORS (429)
+            # ==========================================
             if "429" in error_str or "resource_exhausted" in error_str:
 
-                # RPM LIMIT HIT
-                if "GenerateRequestsPerMinutePerProjectPerModel-FreeTier" in raw_error:
+                # RPM LIMIT HIT → WAIT (NO ROTATION)
+                if "requestsperminute" in error_str:
                     await client.send_message(
                         "me",
                         f"⏳ RPM LIMIT HIT → Key #{key_number} → Waiting 60s"
@@ -251,8 +299,8 @@ async def _call_gemini_api(
                     await asyncio.sleep(60)
                     continue
 
-                # RPD LIMIT HIT
-                elif "GenerateRequestsPerDayPerProjectPerModel-FreeTier" in raw_error:
+                # RPD LIMIT HIT → BLOCK + ROTATE
+                if "requestsperday" in error_str:
                     await client.send_message(
                         "me",
                         f"🚫 RPD LIMIT HIT → Key #{key_number} blocked 24h"
@@ -263,37 +311,35 @@ async def _call_gemini_api(
                     if not is_image_input:
                         current_key_index = (current_key_index + 1) % len(gemini_keys)
                         db.set(collection, "current_key_index", current_key_index)
-
                     continue
 
-                # UNKNOWN 429
-                else:
-                    await client.send_message(
-                        "me",
-                        f"⚠️ UNKNOWN 429 ERROR on Key #{key_number}\n\n{raw_error}"
-                    )
-                    raise e
-
-            # ================================
-            # FILE PERMISSION ERROR (403)
-            # ================================
-            if "403" in error_str and "file" in error_str:
+                # UNKNOWN 429 → ROTATE
                 await client.send_message(
                     "me",
-                    f"❌ FILE ACCESS ERROR on Key #{key_number}: Upload key mismatch."
+                    f"⚠️ UNKNOWN 429 ERROR → Key #{key_number} rotated"
                 )
-                raise e
 
-            # ================================
-            # ANY OTHER ERROR
-            # ================================
+                if not is_image_input:
+                    current_key_index = (current_key_index + 1) % len(gemini_keys)
+                    db.set(collection, "current_key_index", current_key_index)
+                continue
+
+            # ==========================================
+            # ✅ ANY OTHER ERROR → ROTATE KEY
+            # ==========================================
             await client.send_message(
                 "me",
-                f"❌ GEMINI API ERROR on Key #{key_number}\n\n{raw_error}"
+                f"❌ GEMINI ERROR on Key #{key_number} → Rotating\n\n{raw_error}"
             )
-            raise e
+
+            if not is_image_input:
+                current_key_index = (current_key_index + 1) % len(gemini_keys)
+                db.set(collection, "current_key_index", current_key_index)
+
+            continue
 
     raise Exception("All Gemini API keys failed.")
+
 
 
 
@@ -379,6 +425,7 @@ def mark_key_invalid(api_key, key_index):
 
 
 
+
 async def upload_file_to_gemini(file_path, file_type):
     uploaded_file = genai.upload_file(file_path)
     while uploaded_file.state.name == "PROCESSING":
@@ -414,19 +461,7 @@ async def handle_voice_message(client, chat_id, bot_response, message_id):
         return True
     return False
 
-# Persistent Queue Helper Functions for Users
-def load_user_message_queue(user_id):
-    data = db.get(collection, f"user_message_queue.{user_id}")
-    return deque(data) if data else deque()
-
-def save_user_message_to_db(user_id, message_text):
-    queue = db.get(collection, f"user_message_queue.{user_id}") or []
-    queue.append(message_text)
-    db.set(collection, f"user_message_queue.{user_id}", queue)
-
-def clear_user_message_queue(user_id):
-    db.set(collection, f"user_message_queue.{user_id}", None)
-
+#  Queue Helper Functions
 user_message_queues = defaultdict(deque)
 active_users = set()
 
@@ -443,29 +478,33 @@ async def gchat(client: Client, message: Message):
         if user_message.startswith("Reacted to this message with"):
             return
 
-        if user_id not in user_message_queues or not user_message_queues[user_id]:
-            user_message_queues[user_id] = load_user_message_queue(user_id)
-
+        # ✅ RAM Queue Only
         user_message_queues[user_id].append(user_message)
-        save_user_message_to_db(user_id, user_message)
 
+        # Already processing → just queue message
         if user_id in active_users:
             return
 
         active_users.add(user_id)
+
+        # Start processing task
         asyncio.create_task(process_messages(client, message, user_id, user_name))
 
     except Exception as e:
         await client.send_message("me", f"❌ Error in gchat: {str(e)}")
+
 
 async def process_messages(client, message, user_id, user_name):
     try:
         global_role_state = db.get(collection, "global_default_role_state") or "primary"
 
         while user_message_queues[user_id]:
+
+            # Human-like delay
             delay = random.choice([6, 10, 12])
             await asyncio.sleep(delay)
 
+            # Batch up to 3 messages
             batch = []
             for _ in range(3):
                 if user_message_queues[user_id]:
@@ -475,48 +514,77 @@ async def process_messages(client, message, user_id, user_name):
                 break
 
             combined_message = " ".join(batch)
-            clear_user_message_queue(user_id)
-            
+
+            # Role state
             user_specific_state = db.get(collection, f"current_role_key.{user_id}")
             active_state_for_user = user_specific_state or global_role_state
-            
+
             user_primary_role = db.get(collection, f"custom_roles_primary.{user_id}")
             user_secondary_role = db.get(collection, f"custom_roles_secondary.{user_id}")
 
-            if active_state_for_user == "secondary":
-                bot_role_content = user_secondary_role or default_secondary_role
-            else:
-                bot_role_content = user_primary_role or default_bot_role
+            bot_role_content = (
+                user_secondary_role or default_secondary_role
+                if active_state_for_user == "secondary"
+                else user_primary_role or default_bot_role
+            )
 
             model_to_use = gmodel_name
-            
-            chat_history_list = get_chat_history(user_id, bot_role_content, combined_message, user_name)
-            global_history_limit = db.get(collection, "history_limit")
-            if global_history_limit:
-                limited_history = chat_history_list[-int(global_history_limit):]
-            else:
-                limited_history = chat_history_list
 
-            full_prompt = build_gemini_prompt(bot_role_content, limited_history, combined_message)
+            # Chat History
+            chat_history_list = get_chat_history(
+                user_id,
+                bot_role_content,
+                combined_message,
+                user_name
+            )
+
+            global_history_limit = db.get(collection, "history_limit")
+            limited_history = (
+                chat_history_list[-int(global_history_limit):]
+                if global_history_limit
+                else chat_history_list
+            )
+
+            # Prompt Build
+            full_prompt = build_gemini_prompt(
+                bot_role_content,
+                limited_history,
+                combined_message
+            )
+
             await send_typing_action(client, message.chat.id, combined_message)
 
-            bot_response = ""
             try:
-                bot_response = await _call_gemini_api(client, full_prompt, user_id, model_to_use, chat_history_list)
+                # Gemini Response
+                bot_response = await _call_gemini_api(
+                    client,
+                    full_prompt,
+                    user_id,
+                    model_to_use,
+                    chat_history_list
+                )
 
+                # Limit response length
                 max_length = 200
                 if len(bot_response) > max_length:
                     bot_response = bot_response[:max_length] + "..."
 
+                # Save response in history
                 chat_history_list.append(bot_response)
                 db.set(collection, f"chat_history.{user_id}", chat_history_list)
 
-                if await handle_voice_message(client, message.chat.id, bot_response, message.id):
+                # Voice Support
+                if await handle_voice_message(
+                    client,
+                    message.chat.id,
+                    bot_response,
+                    message.id
+                ):
                     continue
 
+                # Typing simulation before reply
                 response_length = len(bot_response)
-                char_delay = 0.03
-                total_delay = response_length * char_delay
+                total_delay = response_length * 0.03
 
                 elapsed_time = 0
                 while elapsed_time < total_delay:
@@ -524,23 +592,37 @@ async def process_messages(client, message, user_id, user_name):
                     await asyncio.sleep(2)
                     elapsed_time += 2
 
+                # Send Reply
                 await message.reply_text(bot_response)
-                await asyncio.sleep(random.uniform(0.5, 2.0))
+
                 if mark_as_read_enabled:
-                    await client.read_chat_history(chat_id=message.chat.id, max_id=message.id)
+                    await client.read_chat_history(
+                        chat_id=message.chat.id,
+                        max_id=message.id
+                    )
 
             except Exception as api_call_e:
+                # Requeue only in RAM (no DB)
                 user_message_queues[user_id].extendleft(reversed(batch))
-                save_user_message_to_db(user_id, combined_message)
-                await client.send_message("me", f"❌ Critical: Failed to process message for user {user_id}. Message re-queued. Error: {str(api_call_e)}")
+
+                await client.send_message(
+                    "me",
+                    f"❌ Failed for user {user_id}, message queue.\nError: {api_call_e}"
+                )
                 break
 
+        # Done processing
         active_users.discard(user_id)
 
     except Exception as e:
-        await client.send_message("me", f"❌ Critical error in `process_messages` for user {user_id}: {str(e)}")
+        await client.send_message(
+            "me",
+            f"❌ Critical error in process_messages for user {user_id}: {str(e)}"
+        )
+
     finally:
         active_users.discard(user_id)
+
 
 @Client.on_message(filters.private & ~filters.me & ~filters.bot, group=2)
 async def handle_files(client: Client, message: Message):
@@ -831,7 +913,7 @@ async def set_gemini_key(client: Client, message: Message):
         current_model = db.get(collection, "gmodel_name") or "Not Set"
 
         # ==========================================
-        # ✅ FAST BLOCKED + INVALID COUNT
+        # ✅ BLOCKED + INVALID COUNT (Accurate)
         # ==========================================
         api_db = get_api_keys_db()
         now = time.time()
@@ -843,8 +925,12 @@ async def set_gemini_key(client: Client, message: Message):
             ]
         })
 
+        # ✅ Only count invalid keys that still exist
+        all_key_values = [k["key"] for k in gemini_keys]
+
         invalid_count = api_db["gemini_key_limits"].count_documents({
-            "status": "invalid"
+            "status": "invalid",
+            "key": {"$in": all_key_values}
         })
 
         # ================================
@@ -869,7 +955,9 @@ async def set_gemini_key(client: Client, message: Message):
 
             if 0 <= index < total_keys:
                 db.set(collection, "current_key_index", index)
-                await message.edit_text(f"✅ Current Gemini API key set to key {index+1}.")
+                await message.edit_text(
+                    f"✅ Current Gemini API key set to key {index+1}."
+                )
             else:
                 await message.edit_text("❌ Key index out of range.")
             return
@@ -890,7 +978,11 @@ async def set_gemini_key(client: Client, message: Message):
 
                 # Fix current index if needed
                 if current_key_index >= len(gemini_keys):
-                    db.set(collection, "current_key_index", max(0, len(gemini_keys) - 1))
+                    db.set(
+                        collection,
+                        "current_key_index",
+                        max(0, len(gemini_keys) - 1)
+                    )
 
                 await message.edit_text(f"✅ Gemini API key {index+1} deleted.")
             else:
