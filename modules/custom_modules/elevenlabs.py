@@ -319,6 +319,139 @@ async def set_elevenlabs_config(client: Client, message: Message):
     else:
         await message.edit_text("❌ Invalid parameter")
         
+@Client.on_message(filters.command(["tovn"], prefix) & filters.me)
+async def convert_to_voice_note(client: Client, message: Message):
+    """
+    Convert a replied MP3 file into a Telegram voice note (OGG/Opus).
+    Usage: Reply to an mp3 file and type .tovn
+    """
+    input_path = None
+    output_path = None
+
+    try:
+        # Must reply to an audio file
+        if not message.reply_to_message or not message.reply_to_message.audio:
+            return await message.edit_text(
+                f"❌ Reply to an MP3 file first.\n\n**Usage:** `{prefix}tovn`",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+
+        await message.edit_text("⏳ Downloading MP3...")
+
+        # Download replied MP3
+        input_path = await message.reply_to_message.download()
+        output_path = "converted_voice_note.ogg"
+
+        await message.edit_text("🎙️ Converting to voice note...")
+
+        # Convert MP3 → OGG Opus (Voice Note Format)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-i", input_path,
+                "-c:a", "libopus",
+                "-b:a", "64k",
+                "-vbr", "on",
+                "-compression_level", "10",
+                output_path
+            ],
+            check=True
+        )
+
+        await message.delete()
+
+        # Send as Telegram voice note
+        await client.send_voice(
+            chat_id=message.chat.id,
+            voice=output_path
+        )
+
+    except Exception as e:
+        await client.send_message(
+            message.chat.id,
+            f"**Error:**\n`{e}`",
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+
+    finally:
+        # Cleanup
+        for path in [input_path, output_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as cleanup_error:
+                    print(f"Cleanup error: {cleanup_error}")
+
+
+@Client.on_message(filters.command(["tov"], prefix) & filters.me)
+async def convert_mp3_to_video(client: Client, message: Message):
+    """
+    Convert a replied MP3 file into an MP4 video.
+    Usage: Reply to an MP3 file and type .tov
+    """
+    audio_path = None
+    video_path = None
+
+    try:
+        # Must reply to an MP3 audio file
+        if not message.reply_to_message or not message.reply_to_message.audio:
+            return await message.edit_text(
+                f"❌ Reply to an MP3 file first.\n\n**Usage:** `{prefix}tov`",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+
+        await message.edit_text("⏳ Downloading MP3...")
+
+        # Download the replied MP3
+        audio_path = await message.reply_to_message.download()
+        video_path = "converted_audio_video.mp4"
+
+        await message.edit_text("🎬 Converting MP3 → Video...")
+
+        # Convert MP3 → MP4 Video (black background)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-f", "lavfi",
+                "-i", "color=c=black:s=480x480",
+                "-i", audio_path,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "35",
+                "-r", "10",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-shortest",
+                "-pix_fmt", "yuv420p",
+                video_path
+            ],
+            check=True
+        )
+
+        await message.delete()
+
+        # Send as Telegram video
+        await client.send_video(
+            chat_id=message.chat.id,
+            video=video_path,
+            caption="🎵 Converted MP3 → Video"
+        )
+
+    except Exception as e:
+        await client.send_message(
+            message.chat.id,
+            f"**Error:**\n`{e}`",
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+
+    finally:
+        # Cleanup files
+        for path in [audio_path, video_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as cleanup_error:
+                    print(f"Cleanup error: {cleanup_error}")
 
 modules_help["elevenlabs"] = {
     "el [text]*": "Generate voice message using ElevenLabs",
