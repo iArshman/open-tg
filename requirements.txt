@@ -25,3 +25,4 @@ pytz
 mutagen
 google-genai
 motor
+pyminizip
