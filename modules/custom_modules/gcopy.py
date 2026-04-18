@@ -443,6 +443,144 @@ async def gdownload(client: Client, message: Message):
     )
 
 
+import pyminizip  # Add this at the top with other imports
+
+# ... (baqi functions same rahein ge)
+
+@Client.on_message(filters.command(["gdlp"], prefix) & filters.me)
+async def gdlp(client: Client, message: Message):
+    global _running, _cancel
+
+    args = message.command[1:]
+    # Usage: .gdlp <password> <chat_id> <thread_id>
+    # Minimum 1 argument (password) required
+    if len(args) < 1:
+        return await message.edit(
+            f"<b>Usage:</b>\n"
+            f"<code>{prefix}gdlp &lt;password&gt;</code> — current thread\n"
+            f"<code>{prefix}gdlp &lt;password&gt; &lt;chat_id&gt;</code> — full chat\n"
+            f"<code>{prefix}gdlp &lt;password&gt; &lt;chat_id&gt; &lt;thread_id&gt;</code> — specific thread"
+        )
+
+    password = args[0]
+    src_id = message.chat.id
+    thread_id = message.message_thread_id
+
+    if len(args) == 2:
+        try: src_id = int(args[1]); thread_id = None
+        except: return await message.edit("❌ Invalid chat ID.")
+    elif len(args) == 3:
+        try: src_id = int(args[1]); thread_id = int(args[2])
+        except: return await message.edit("❌ Invalid IDs.")
+
+    if _running:
+        return await message.edit(f"⚠️ Job running. Use <code>{prefix}gcopystop</code> to cancel.")
+
+    _running = True; _cancel = False
+
+    # Directory setup (Same as gdownload)
+    try:
+        chat_obj = await client.get_chat(src_id)
+        chat_title = _safe_name(chat_obj.title or chat_obj.first_name or str(src_id))
+    except:
+        chat_title = f"chat_{abs(src_id)}"
+
+    run_dir = os.path.join(TEMP_DIR, _ts())
+    os.makedirs(run_dir, exist_ok=True)
+
+    status = await message.edit(f"⏳ Resolving topics and fetching messages for <b>{chat_title}</b>...")
+
+    # Fetching process
+    topic_names = await _get_topic_names(client, src_id)
+    try:
+        msgs = await _fetch_all(client, src_id, thread_id, status)
+    except Exception as e:
+        _reset(); shutil.rmtree(run_dir, ignore_errors=True)
+        return await status.edit(f"❌ Fetch failed:\n<code>{format_exc(e)}</code>")
+
+    if not msgs:
+        _reset(); shutil.rmtree(run_dir, ignore_errors=True)
+        return await status.edit("⚠️ No messages found.")
+
+    # Media and Text Processing (Logic same as gdownload)
+    threads = defaultdict(list)
+    for m in msgs: threads[m.message_thread_id].append(m)
+
+    downloaded = failed = processed = 0
+    total = len(msgs)
+
+    for tid, thread_msgs in threads.items():
+        if _cancel: break
+        folder_name = _safe_name(topic_names.get(tid, f"thread_{tid}")) if tid else "general"
+        thread_dir = os.path.join(run_dir, folder_name)
+        media_dir = os.path.join(thread_dir, "media")
+        os.makedirs(media_dir, exist_ok=True)
+        
+        text_lines = []
+        for msg in thread_msgs:
+            if _cancel: break
+            processed += 1
+            line = _msg_to_text(msg)
+            if line: text_lines.append(line)
+            if msg.media and not _is_service(msg):
+                try:
+                    await client.download_media(msg, file_name=media_dir + "/")
+                    downloaded += 1
+                except: failed += 1
+            
+            if processed % 20 == 0:
+                await status.edit(f"📥 <b>{processed}/{total}</b> (Locked ZIP Mode)\nMedia: ✅ {downloaded}")
+        
+        # Save TXT
+        with open(os.path.join(thread_dir, "messages.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(text_lines))
+
+    if _cancel:
+        _reset(); shutil.rmtree(run_dir, ignore_errors=True)
+        return await status.edit("🛑 Cancelled.")
+
+    # --- PASSWORD PROTECTED ZIP LOGIC ---
+    await status.edit("🗜 Creating <b>Password-Protected</b> ZIP...")
+    
+    zip_label = _safe_name(topic_names.get(thread_id, f"thread_{thread_id}")) if thread_id else chat_title
+    zip_path = os.path.join(TEMP_DIR, f"{zip_label}.zip")
+    
+    try:
+        # Pyminizip requires a list of files and their relative paths
+        files_to_zip = []
+        for root, _, files in os.walk(run_dir):
+            for f in files:
+                files_to_zip.append(os.path.join(root, f))
+        
+        # Getting relative paths for inside the ZIP
+        prefixes = [os.path.relpath(f, run_dir) for f in files_to_zip]
+        
+        # compression level 1-9
+        pyminizip.compress_multiple(files_to_zip, prefixes, zip_path, password, 4)
+        
+    except Exception as e:
+        _reset(); shutil.rmtree(run_dir, ignore_errors=True)
+        return await status.edit(f"❌ Protected ZIP failed:\n<code>{format_exc(e)}</code>")
+
+    # Uploading
+    zip_mb = os.path.getsize(zip_path) / (1024 * 1024)
+    await status.edit(f"📤 Uploading locked ZIP...")
+    
+    try:
+        await client.send_document(
+            "me",
+            document=zip_path,
+            file_name=f"{zip_label}.zip",
+            caption=f"🔐 <b>{zip_label} (Protected)</b>\nPassword: <code>{password}</code>\nSize: {zip_mb:.1f} MB"
+        )
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        if os.path.exists(zip_path): os.remove(zip_path)
+
+    _reset()
+    await status.edit(f"✅ <b>Done!</b> Saved in messages with password protection.")
+
+
 # ── .gcopystop ───────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command(["gcopystop", "gcstop"], prefix) & filters.me)
