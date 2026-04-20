@@ -443,19 +443,27 @@ async def gdownload(client: Client, message: Message):
     )
 
 
+import pyminizip
+
+
 @Client.on_message(filters.command(["gdlp"], prefix) & filters.me)
 async def gdownload_password(client: Client, message: Message):
     global _running, _cancel
 
     args = message.command[1:]
 
-    if len(args) == 0:
-        return await message.edit("❌ Usage: .gdlp <password> [chat_id] [thread_id]")
-
-    password = args[0]
-
     auto_src = message.chat.id
     auto_thread = message.message_thread_id
+
+    if len(args) == 0:
+        return await message.edit(
+            f"<b>Usage:</b>\n"
+            f"<code>{prefix}gdlp &lt;password&gt;</code> — current thread\n"
+            f"<code>{prefix}gdlp &lt;password&gt; &lt;chat_id&gt;</code> — full group\n"
+            f"<code>{prefix}gdlp &lt;password&gt; &lt;chat_id&gt; &lt;thread_id&gt;</code> — one thread"
+        )
+
+    password = args[0]
 
     if len(args) == 1:
         src_id = auto_src
@@ -465,55 +473,87 @@ async def gdownload_password(client: Client, message: Message):
         try:
             src_id = int(args[1])
             thread_id = None
-        except:
-            return await message.edit("❌ Invalid chat_id")
+        except ValueError:
+            return await message.edit("❌ Invalid chat ID.")
 
     elif len(args) == 3:
         try:
             src_id = int(args[1])
             thread_id = int(args[2])
-        except:
-            return await message.edit("❌ Invalid IDs")
+        except ValueError:
+            return await message.edit("❌ Invalid IDs.")
 
     else:
-        return await message.edit("❌ Too many arguments")
+        return await message.edit("❌ Too many arguments.")
 
     if _running:
-        return await message.edit("⚠️ Another job already running")
+        return await message.edit(
+            f"⚠️ Job running. Use <code>{prefix}gcopystop</code> to cancel."
+        )
 
     _running = True
     _cancel = False
 
-    status = await message.edit("⏳ Starting password download...")
-
     try:
         chat_obj = await client.get_chat(src_id)
-        chat_title = _safe_name(chat_obj.title or str(src_id))
-    except:
-        chat_title = f"chat_{src_id}"
+        chat_title = _safe_name(chat_obj.title or chat_obj.first_name or str(src_id))
+    except Exception:
+        chat_title = f"chat_{abs(src_id)}"
 
     run_dir = os.path.join(TEMP_DIR, _ts())
     os.makedirs(run_dir, exist_ok=True)
 
+    status = await message.edit(
+        f"⏳ Resolving topic names for <b>{chat_title}</b>…"
+    )
+
     topic_names = await _get_topic_names(client, src_id)
 
-    msgs = await _fetch_all(client, src_id, thread_id, status)
+    await status.edit(
+        f"⏳ <b>Fetching messages fast…</b>\n"
+        f"<b>{chat_title}</b> — {len(topic_names)} topics found"
+        + (f" › thread <code>{thread_id}</code>" if thread_id else "")
+    )
 
-    if not msgs:
+    try:
+        msgs = await _fetch_all(client, src_id, thread_id, status)
+    except Exception as e:
         _reset()
-        return await status.edit("⚠️ No messages found")
+        shutil.rmtree(run_dir, ignore_errors=True)
+        return await status.edit(f"❌ Fetch failed:\n<code>{format_exc(e)}</code>")
+
+    total = len(msgs)
+
+    if total == 0:
+        _reset()
+        shutil.rmtree(run_dir, ignore_errors=True)
+        return await status.edit("⚠️ No messages found.")
 
     threads = defaultdict(list)
 
     for msg in msgs:
         threads[msg.message_thread_id].append(msg)
 
-    downloaded = 0
+    media_total = sum(
+        1 for m in msgs if m.media and not _is_service(m)
+    )
+
+    await status.edit(
+        f"📥 <b>{total} messages</b> in <b>{len(threads)} thread(s)</b> — {media_total} media\n"
+        f"<code>{prefix}gcopystop</code> to cancel."
+    )
+
+    downloaded = failed = processed = 0
 
     for tid, thread_msgs in threads.items():
 
-        folder_name = _safe_name(
-            topic_names.get(tid, f"thread_{tid}") if tid else "general"
+        if _cancel:
+            break
+
+        folder_name = (
+            "general"
+            if tid is None
+            else _safe_name(topic_names.get(tid, f"thread_{tid}"))
         )
 
         thread_dir = os.path.join(run_dir, folder_name)
@@ -521,17 +561,74 @@ async def gdownload_password(client: Client, message: Message):
 
         os.makedirs(media_dir, exist_ok=True)
 
+        text_lines = []
+
         for msg in thread_msgs:
+
+            if _cancel:
+                break
+
+            processed += 1
+
+            line = _msg_to_text(msg)
+
+            if line:
+                text_lines.append(line)
 
             if msg.media and not _is_service(msg):
 
                 try:
-                    await client.download_media(msg, file_name=media_dir + "/")
+                    await client.download_media(
+                        msg,
+                        file_name=media_dir + "/"
+                    )
+
                     downloaded += 1
-                except:
+
+                except Exception:
+                    failed += 1
+
+            if processed % 20 == 0:
+
+                try:
+                    await status.edit(
+                        f"📥 <b>{processed}/{total}</b> — 📁 <b>{folder_name}</b>\n"
+                        f"Media: ✅ {downloaded} ❌ {failed}"
+                    )
+
+                except Exception:
                     pass
 
-    await status.edit("🔐 Creating password ZIP...")
+            await asyncio.sleep(0)
+
+        txt_path = os.path.join(thread_dir, "messages.txt")
+
+        with open(txt_path, "w", encoding="utf-8") as f:
+
+            header = f"Chat: {chat_title} ({src_id})"
+
+            if tid:
+                header += f" | Topic: {folder_name} (id:{tid})"
+
+            f.write(header + "\n")
+            f.write(
+                f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+            f.write(f"Text messages: {len(text_lines)}\n")
+            f.write("=" * 60 + "\n\n")
+            f.write("\n".join(text_lines))
+
+    if _cancel:
+
+        _reset()
+
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+        return await status.edit(
+            f"🛑 Cancelled. Processed {processed}/{total}."
+        )
+
+    await status.edit("🔐 Creating password ZIP…")
 
     zip_name = os.path.join(TEMP_DIR, f"{chat_title}.zip")
 
@@ -543,13 +640,22 @@ async def gdownload_password(client: Client, message: Message):
         5
     )
 
-    await status.edit("📤 Uploading encrypted ZIP...")
+    zip_mb = os.path.getsize(zip_name) / (1024 * 1024)
+
+    await status.edit(
+        f"📤 Uploading encrypted <b>{chat_title}.zip</b> ({zip_mb:.1f} MB)…"
+    )
 
     await client.send_document(
         message.chat.id,
         zip_name,
         message_thread_id=message.message_thread_id,
-        caption=f"🔐 Password ZIP\nChat: {chat_title}\nPassword: <code>{password}</code>",
+        caption=(
+            f"🔐 <b>{chat_title}.zip</b>\n"
+            f"Threads: {len(threads)} | Messages: {total}\n"
+            f"Media: {downloaded} | Size: {zip_mb:.1f} MB\n"
+            f"Password: <code>{password}</code>"
+        ),
         parse_mode=enums.ParseMode.HTML
     )
 
@@ -562,7 +668,9 @@ async def gdownload_password(client: Client, message: Message):
 
     _reset()
 
-    await status.edit("✅ Password ZIP uploaded successfully")
+    await status.edit(
+        f"✅ <b>Done!</b> — encrypted ZIP uploaded in current thread."
+    )
 
 # ── .gcopystop ───────────────────────────────────────────────────────────────
 
