@@ -1,18 +1,3 @@
-"""
-gcopy.py - Group/Thread Copy & Download Module for Moon-Userbot
-===============================================================
-Commands:
-  .gcopy <dst>                        — copy current thread → dst (auto)
-  .gcopy <src> <dst>                  — copy full group
-  .gcopy <src> <thread_id> <dst>      — copy specific thread
-
-  .gdownload                          — download current thread (auto)
-  .gdownload <chat_id>                — download ALL threads, folder per thread
-  .gdownload <chat_id> <thread_id>    — download one specific thread
-
-  .gcopystop                          — cancel running job
-"""
-
 import asyncio
 import os
 import re
