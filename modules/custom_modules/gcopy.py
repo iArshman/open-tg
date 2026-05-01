@@ -5,6 +5,7 @@ import shutil
 import zipfile
 from collections import defaultdict
 from datetime import datetime
+import pyminizip
 
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait, RPCError
@@ -442,7 +443,224 @@ async def gdownload(client: Client, message: Message):
         f"Check your <b>Saved Messages</b>."
     )
 
+@Client.on_message(filters.command(["gdlp"], prefix) & filters.me)
+async def gdownload_password(client: Client, message: Message):
+    global _running, _cancel
 
+    args = message.command[1:]
+
+    if len(args) == 0:
+        return await message.edit(
+            f"<b>Usage:</b>\n"
+            f"<code>{prefix}gdlp &lt;password&gt;</code>\n"
+            f"<code>{prefix}gdlp &lt;password&gt; &lt;chat_id&gt;</code>\n"
+            f"<code>{prefix}gdlp &lt;password&gt; &lt;chat_id&gt; &lt;thread_id&gt;</code>"
+        )
+
+    password = args[0]
+    args = args[1:]
+
+    auto_src = message.chat.id
+    auto_thread = message.message_thread_id
+
+    if len(args) == 0:
+        src_id = auto_src
+        thread_id = auto_thread
+    elif len(args) == 1:
+        try:
+            src_id = int(args[0])
+            thread_id = None
+        except ValueError:
+            return await message.edit("❌ Invalid chat ID.")
+    elif len(args) == 2:
+        try:
+            src_id = int(args[0])
+            thread_id = int(args[1])
+        except ValueError:
+            return await message.edit("❌ Invalid IDs.")
+    else:
+        return await message.edit("❌ Invalid arguments.")
+
+    if _running:
+        return await message.edit(
+            f"⚠️ Job running. Use <code>{prefix}gcopystop</code> to cancel."
+        )
+
+    _running = True
+    _cancel = False
+
+    try:
+        chat_obj = await client.get_chat(src_id)
+        chat_title = _safe_name(
+            chat_obj.title or chat_obj.first_name or str(src_id)
+        )
+    except Exception:
+        chat_title = f"chat_{abs(src_id)}"
+
+    run_dir = os.path.join(TEMP_DIR, _ts())
+    os.makedirs(run_dir, exist_ok=True)
+
+    status = await message.edit(
+        f"⏳ Resolving topic names for <b>{chat_title}</b>…"
+    )
+
+    topic_names = await _get_topic_names(client, src_id)
+
+    await status.edit(
+        f"⏳ <b>Fetching messages fast…</b>\n"
+        f"<b>{chat_title}</b> — {len(topic_names)} topics found"
+        + (f" › thread <code>{thread_id}</code>" if thread_id else "")
+    )
+
+    try:
+        msgs = await _fetch_all(client, src_id, thread_id, status)
+    except Exception as e:
+        _reset()
+        shutil.rmtree(run_dir, ignore_errors=True)
+        return await status.edit(
+            f"❌ Fetch failed:\n<code>{format_exc(e)}</code>"
+        )
+
+    total = len(msgs)
+
+    if total == 0:
+        _reset()
+        shutil.rmtree(run_dir, ignore_errors=True)
+        return await status.edit("⚠️ No messages found.")
+
+    threads = defaultdict(list)
+
+    for msg in msgs:
+        threads[msg.message_thread_id].append(msg)
+
+    media_total = sum(
+        1 for m in msgs if m.media and not _is_service(m)
+    )
+
+    await status.edit(
+        f"📥 <b>{total} messages</b> in <b>{len(threads)} thread(s)</b> — {media_total} media\n"
+        f"<code>{prefix}gcopystop</code> to cancel."
+    )
+
+    downloaded = failed = processed = 0
+
+    for tid, thread_msgs in threads.items():
+
+        if _cancel:
+            break
+
+        if tid is None:
+            folder_name = "general"
+        else:
+            folder_name = _safe_name(
+                topic_names.get(tid, f"thread_{tid}")
+            )
+
+        thread_dir = os.path.join(run_dir, folder_name)
+        media_dir = os.path.join(thread_dir, "media")
+
+        os.makedirs(media_dir, exist_ok=True)
+
+        text_lines = []
+
+        for msg in thread_msgs:
+
+            if _cancel:
+                break
+
+            processed += 1
+
+            line = _msg_to_text(msg)
+
+            if line:
+                text_lines.append(line)
+
+            if msg.media and not _is_service(msg):
+
+                try:
+                    await client.download_media(
+                        msg,
+                        file_name=media_dir + "/"
+                    )
+                    downloaded += 1
+
+                except Exception:
+                    failed += 1
+
+            if processed % 20 == 0:
+
+                try:
+                    await status.edit(
+                        f"📥 <b>{processed}/{total}</b> — 📁 <b>{folder_name}</b>\n"
+                        f"Media: ✅ {downloaded} ❌ {failed}"
+                    )
+                except Exception:
+                    pass
+
+        txt_path = os.path.join(thread_dir, "messages.txt")
+
+        with open(txt_path, "w", encoding="utf-8") as f:
+
+            f.write("\n".join(text_lines))
+
+    if _cancel:
+
+        _reset()
+
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+        return await status.edit(
+            f"🛑 Cancelled. Processed {processed}/{total}."
+        )
+
+    await status.edit("🔐 Creating password protected ZIP…")
+
+    zip_label = (
+        _safe_name(topic_names.get(thread_id))
+        if thread_id
+        else chat_title
+    )
+
+    zip_path = os.path.join(
+        TEMP_DIR,
+        f"{zip_label}.zip"
+    )
+
+    pyminizip.compress_multiple(
+        [run_dir],
+        [],
+        zip_path,
+        password,
+        5
+    )
+
+    zip_mb = os.path.getsize(zip_path) / (1024 * 1024)
+
+    await status.edit(
+        f"📤 Uploading <b>{zip_label}.zip</b> ({zip_mb:.1f} MB)…"
+    )
+
+    await client.send_document(
+        "me",
+        zip_path,
+        caption=(
+            f"🔐 <b>{zip_label}</b>\n"
+            f"Password: <code>{password}</code>\n"
+            f"Threads: {len(threads)} | Messages: {total} | Media: {downloaded}"
+        ),
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    shutil.rmtree(run_dir, ignore_errors=True)
+
+    os.remove(zip_path)
+
+    _reset()
+
+    await status.edit(
+        f"<b>Done!</b> — password protected ZIP sent."
+    )
+    
 # ── .gcopystop ───────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command(["gcopystop", "gcstop"], prefix) & filters.me)
