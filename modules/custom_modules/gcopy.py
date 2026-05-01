@@ -5,7 +5,7 @@ import shutil
 import zipfile
 from collections import defaultdict
 from datetime import datetime
-import pyminizip
+import pyzipper
 
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait, RPCError
