@@ -602,13 +602,23 @@ async def process_messages(client, message, user_id, user_name):
                     )
 
             except Exception as api_call_e:
-                # Requeue only in RAM (no DB)
-                user_message_queues[user_id].extendleft(reversed(batch))
-
-                await client.send_message(
-                    "me",
-                    f"❌ Failed for user {user_id}, message queue.\nError: {api_call_e}"
-                )
+                error_msg = str(api_call_e).lower()
+                
+                # Check if it's a permanent safety block
+                if "prohibited_content" in error_msg or "candidates is empty" in error_msg or "block_reason" in error_msg:
+                    await client.send_message(
+                        "me",
+                        f"🚫 Message permanently dropped for user {user_id} due to PROHIBITED_CONTENT.\nError: {api_call_e}"
+                    )
+                    # Do NOT requeue the message. Just let it drop.
+                else:
+                    # Requeue only in RAM (no DB) for temporary errors
+                    user_message_queues[user_id].extendleft(reversed(batch))
+                    await client.send_message(
+                        "me",
+                        f"❌ Failed for user {user_id}, message queue.\nError: {api_call_e}"
+                    )
+                
                 break
 
         # Done processing
@@ -622,7 +632,6 @@ async def process_messages(client, message, user_id, user_name):
 
     finally:
         active_users.discard(user_id)
-
 
 @Client.on_message(filters.private & ~filters.me & ~filters.bot, group=2)
 async def handle_files(client: Client, message: Message):
