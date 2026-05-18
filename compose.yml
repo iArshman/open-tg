@@ -1,0 +1,15 @@
+services:
+    moonuserbot:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        container_name: moonuserbot
+        restart: unless-stopped
+        env_file:
+            - .env
+        networks:
+            - default
+
+networks:
+    default:
+        external: false
