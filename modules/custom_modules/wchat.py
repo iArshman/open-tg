@@ -234,10 +234,6 @@ def build_gemini_prompt(bot_role, chat_history_list, user_message, file_descript
         prompt += f"\n\n{file_description}"
     return prompt
 
-async def send_typing_action(client, chat_id, user_message):
-    await client.send_chat_action(chat_id=chat_id, action=enums.ChatAction.TYPING)
-    await asyncio.sleep(min(len(user_message) / 10, 5))
-
 async def handle_voice_message(client, chat_id, bot_response, thread_id=None):
     global elevenlabs_enabled
     
