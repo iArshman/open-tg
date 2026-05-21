@@ -7,7 +7,6 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 import pytz
 from datetime import datetime
-from utils.config import gemini_key
 from utils.db import db
 from utils.misc import modules_help, prefix
 from utils.scripts import import_library
@@ -42,14 +41,17 @@ collection = "custom.gchat"
 
 
 # Database initialization
-enabled_users = db.get(collection, "enabled_users") or []
-disabled_users = db.get(collection, "disabled_users") or []
+enabled_users = set(db.get(collection, "enabled_users") or [])
+disabled_users = set(db.get(collection, "disabled_users") or [])
 gchat_for_all = db.get(collection, "gchat_for_all") or False
 mark_as_read_enabled = db.get(collection, "mark_as_read_enabled") or False
 elevenlabs_enabled = db.get(collection, "elevenlabs_enabled") or False
 
 # A single model for the entire system
 gmodel_name = db.get(collection, "gmodel_name") or "gemini-3.1-flash-lite-preview"
+
+# Persistent MongoDB connection — created once, reused for all calls
+_mongo_client = pymongo.MongoClient(config.db_url)
 
 
 def get_chat_history(user_id, bot_role, user_message, user_name):
@@ -152,10 +154,6 @@ User Current Message:
         prompt += f"\n\n{file_description}"
     return prompt
 
-async def send_typing_action(client, chat_id, user_message):
-    await client.send_chat_action(chat_id=chat_id, action=enums.ChatAction.TYPING)
-    await asyncio.sleep(min(len(user_message) / 10, 5))
-
 async def _call_gemini_api(
     client: Client,
     input_data,
@@ -164,12 +162,9 @@ async def _call_gemini_api(
     chat_history_list: list,
     is_image_input: bool = False
 ):
-    # 1. Get all keys and filter for only those that are currently available
+    # 1. Get all keys and filter available ones in a single bulk DB query
     all_keys = get_gemini_keys()
-    gemini_keys = [
-        k for k in all_keys 
-        if is_key_available(k["key"] if isinstance(k, dict) else k)
-    ]
+    gemini_keys = get_available_keys_bulk(all_keys)
 
     if not gemini_keys:
         raise ValueError("No working Gemini API keys available (all are blocked or invalid).")
@@ -270,9 +265,8 @@ async def _call_gemini_api(
 
     
 def get_api_keys_db():
-    """Get connection to separate API Keys database"""
-    client = pymongo.MongoClient(config.db_url)
-    return client["ApiKeys"]
+    """Get connection to separate API Keys database (reuses persistent client)"""
+    return _mongo_client["ApiKeys"]
 
 def get_gemini_keys():
     """Get Gemini API keys from centralized Api Keys database"""
@@ -311,24 +305,42 @@ def add_gemini_key(new_key):
     print(f"Key already exists in Api Keys database")
     return False
 
+def get_available_keys_bulk(all_keys):
+    """Single DB query to filter all available keys — replaces per-key is_key_available calls."""
+    api_db = get_api_keys_db()
+    now = time.time()
+    key_values = [k["key"] if isinstance(k, dict) else k for k in all_keys]
+
+    # One query fetches all limit records at once
+    limit_records = {
+        doc["key"]: doc
+        for doc in api_db["gemini_key_limits"].find({"key": {"$in": key_values}})
+    }
+
+    available = []
+    for k in all_keys:
+        key_str = k["key"] if isinstance(k, dict) else k
+        data = limit_records.get(key_str, {})
+        if data.get("status") == "invalid":
+            continue
+        if data.get("rpm_block_until", 0) > now:
+            continue
+        if data.get("rpd_block_until", 0) > now:
+            continue
+        available.append(k)
+    return available
+
 def is_key_available(api_key):
+    """Single-key availability check (used outside bulk filtering)."""
     api_db = get_api_keys_db()
     data = api_db["gemini_key_limits"].find_one({"key": api_key}) or {}
-
     now = time.time()
-
-    # 🚫 Invalid key permanently skipped
     if data.get("status") == "invalid":
         return False
-
-    # RPM cooldown
     if data.get("rpm_block_until", 0) > now:
         return False
-
-    # RPD exhausted
     if data.get("rpd_block_until", 0) > now:
         return False
-
     return True
 
     
@@ -455,9 +467,15 @@ async def process_messages(client, message, user_id, user_name):
 
         while user_message_queues[user_id]:
 
-            # Human-like delay
+            # Wait 3s, then show typing for the remaining delay
             delay = random.choice([6, 10, 12])
-            await asyncio.sleep(delay)
+            await asyncio.sleep(3)
+            remaining = delay - 3
+            elapsed = 0
+            while elapsed < remaining:
+                await client.send_chat_action(chat_id=message.chat.id, action=enums.ChatAction.TYPING)
+                await asyncio.sleep(min(4, remaining - elapsed))
+                elapsed += 4
 
             # Batch up to 3 messages
             batch = []
@@ -470,12 +488,24 @@ async def process_messages(client, message, user_id, user_name):
 
             combined_message = " ".join(batch)
 
-            # Role state
-            user_specific_state = db.get(collection, f"current_role_key.{user_id}")
-            active_state_for_user = user_specific_state or global_role_state
+            # Role state — batch all user config reads in one call
+            user_config = db.get_many(collection, [
+                f"current_role_key.{user_id}",
+                f"custom_roles_primary.{user_id}",
+                f"custom_roles_secondary.{user_id}",
+                "history_limit",
+            ]) if hasattr(db, "get_many") else {
+                f"current_role_key.{user_id}": db.get(collection, f"current_role_key.{user_id}"),
+                f"custom_roles_primary.{user_id}": db.get(collection, f"custom_roles_primary.{user_id}"),
+                f"custom_roles_secondary.{user_id}": db.get(collection, f"custom_roles_secondary.{user_id}"),
+                "history_limit": db.get(collection, "history_limit"),
+            }
 
-            user_primary_role = db.get(collection, f"custom_roles_primary.{user_id}")
-            user_secondary_role = db.get(collection, f"custom_roles_secondary.{user_id}")
+            user_specific_state = user_config.get(f"current_role_key.{user_id}")
+            active_state_for_user = user_specific_state or global_role_state
+            user_primary_role = user_config.get(f"custom_roles_primary.{user_id}")
+            user_secondary_role = user_config.get(f"custom_roles_secondary.{user_id}")
+            global_history_limit = user_config.get("history_limit")
 
             bot_role_content = (
                 user_secondary_role or default_secondary_role
@@ -493,7 +523,6 @@ async def process_messages(client, message, user_id, user_name):
                 user_name
             )
 
-            global_history_limit = db.get(collection, "history_limit")
             limited_history = (
                 chat_history_list[-int(global_history_limit):]
                 if global_history_limit
@@ -506,8 +535,6 @@ async def process_messages(client, message, user_id, user_name):
                 limited_history,
                 combined_message
             )
-
-            await send_typing_action(client, message.chat.id, combined_message)
 
             try:
                 # Gemini Response
@@ -524,7 +551,7 @@ async def process_messages(client, message, user_id, user_name):
                 if len(bot_response) > max_length:
                     bot_response = bot_response[:max_length] + "..."
 
-                # Save response in history
+                # Append response to in-memory history (get_chat_history already persisted user msg)
                 chat_history_list.append(bot_response)
                 db.set(collection, f"chat_history.{user_id}", chat_history_list)
 
@@ -537,17 +564,7 @@ async def process_messages(client, message, user_id, user_name):
                 ):
                     continue
 
-                # Typing simulation before reply
-                response_length = len(bot_response)
-                total_delay = response_length * 0.03
-
-                elapsed_time = 0
-                while elapsed_time < total_delay:
-                    await send_typing_action(client, message.chat.id, bot_response)
-                    await asyncio.sleep(2)
-                    elapsed_time += 2
-
-                # Send Reply
+                # Send reply
                 await message.reply_text(bot_response)
 
                 if mark_as_read_enabled:
@@ -721,20 +738,16 @@ async def gchat_command(client: Client, message: Message):
         user_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else message.chat.id
 
         if command == "on":
-            if user_id in disabled_users:
-                disabled_users.remove(user_id)
-                db.set(collection, "disabled_users", disabled_users)
-            if user_id not in enabled_users:
-                enabled_users.append(user_id)
-                db.set(collection, "enabled_users", enabled_users)
+            disabled_users.discard(user_id)
+            db.set(collection, "disabled_users", list(disabled_users))
+            enabled_users.add(user_id)
+            db.set(collection, "enabled_users", list(enabled_users))
             await client.send_message("me", f"<b>gchat enabled for user {user_id}.</b>")
         elif command == "off":
-            if user_id not in disabled_users:
-                disabled_users.append(user_id)
-                db.set(collection, "disabled_users", disabled_users)
-            if user_id in enabled_users:
-                enabled_users.remove(user_id)
-                db.set(collection, "enabled_users", enabled_users)
+            disabled_users.add(user_id)
+            db.set(collection, "disabled_users", list(disabled_users))
+            enabled_users.discard(user_id)
+            db.set(collection, "enabled_users", list(enabled_users))
             await client.send_message("me", f"<b>gchat disabled for user {user_id}.</b>")
         elif command == "del":
             db.set(collection, f"chat_history.{user_id}", None)
