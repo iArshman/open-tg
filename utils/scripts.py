@@ -492,6 +492,12 @@ async def load_module(
 
     module.__meta__ = meta
 
+    # Fix 5: refresh help navigator so new module appears in .help
+    from utils.module import ModuleManager
+    help_navigator = ModuleManager.get_instance().help_navigator
+    if help_navigator:
+        help_navigator.refresh()
+
     return module
 
 
@@ -503,11 +509,18 @@ async def unload_module(module_name: str, client: Client) -> bool:
     module = importlib.import_module(path)
 
     for _name, obj in vars(module).items():
-        for handler, group in getattr(obj, "handlers", []):
-            client.remove_handler(handler, group)
+        if isinstance(getattr(obj, "handlers", []), list):  # Fix: guard against non-list handlers
+            for handler, group in getattr(obj, "handlers", []):
+                client.remove_handler(handler, group)
 
-    del modules_help[module_name]
+    modules_help.pop(module_name, None)  # Fix: safe pop, no KeyError if missing
     del sys.modules[path]
+
+    # Fix 5: refresh help navigator so unloaded module disappears from .help
+    from utils.module import ModuleManager
+    help_navigator = ModuleManager.get_instance().help_navigator
+    if help_navigator:
+        help_navigator.refresh()
 
     return True
 
@@ -528,6 +541,66 @@ def parse_meta_comments(code: str) -> Dict[str, str]:
         return {}
 
     return {groups[i]: groups[i + 1] for i in range(0, len(groups), 2)}
+
+
+async def generate_screenshot(url: str):
+    """Take a screenshot of a URL using the apiflash API.
+    Requires APIFLASH_KEY in config/env."""
+    import aiohttp
+    from utils import config
+    api_key = getattr(config, "apiflash_key", None)
+    if not api_key:
+        return None
+    api_url = f"https://api.apiflash.com/v1/urltoimage?access_key={api_key}&url={url}&format=png"
+    async with aiohttp.ClientSession() as session, session.get(api_url) as resp:
+        if resp.status == 200:
+            return BytesIO(await resp.read())
+    return None
+
+
+# https://git.cubable.date/QEcho/custom-plugins/src/commit/2144d656b740b27e1855d6eaad4e136a14a3862f/utils/ai_tools.py#L160
+async def generate_waveform(audio_bytes: bytes, points: int = 100) -> tuple[bytes, int]:
+    """
+    Decode audio with miniaudio and compute a 5-bit waveform + duration.
+    Returns (waveform_bytes, duration_seconds).
+    Requires: pip install miniaudio
+    """
+    import miniaudio  # skipcq
+
+    try:
+        decoded = miniaudio.decode(
+            audio_bytes,
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=16000,
+        )
+
+        samples = decoded.samples  # array.array of int16
+        duration = decoded.num_frames // 16000
+
+        if not samples:
+            return b"\x00" * ((points * 5 + 7) // 8), duration
+
+        chunk_size = max(1, len(samples) // points)
+        values = []
+
+        for i in range(points):
+            window = samples[i * chunk_size : (i + 1) * chunk_size]
+            if window:
+                rms = math.sqrt(sum(s * s for s in window) / len(window))
+                values.append(int(min(31, rms / 1000)))
+            else:
+                values.append(0)
+
+        bits = "".join(f"{v:05b}" for v in values)
+        bits = bits.ljust((len(bits) + 7) // 8 * 8, "0")
+        waveform = bytes(int(bits[i : i + 8], 2) for i in range(0, len(bits), 8))
+
+        return waveform, duration
+
+    except Exception:
+        empty_length = (points * 5 + 7) // 8
+        return b"\x00" * empty_length, 0
 
 
 def ReplyCheck(message: Message):
