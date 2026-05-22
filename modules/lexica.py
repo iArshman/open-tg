@@ -14,10 +14,16 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+# Copyright 2023 Qewertyy, MIT License (lexica API helpers)
+
+import asyncio
+import logging
 import os
 import re
 import time
+
 from bs4 import BeautifulSoup
+from lexica import AsyncClient, Client as LexicaClient
 import requests
 
 from pyrogram import Client, filters
@@ -25,13 +31,55 @@ from pyrogram.types import Message
 
 from utils.misc import modules_help, prefix
 from utils.scripts import format_exc, format_module_help, progress
-from utils.lexicapi import ImageGeneration, UpscaleImages, ImageModels
 
+
+# --- Lexica API helpers (inlined from utils/lexicapi.py) ---
+
+def _image_models() -> dict:
+    models = LexicaClient().models["models"]["image"]
+    return {m["name"]: m["id"] for m in models}
+
+
+async def _image_generation(model, prompt):
+    try:
+        output = await AsyncClient().generate(model, prompt, "")
+        if output["code"] != 1:
+            return 2
+        if output["code"] == 69:
+            return output["code"]
+        task_id, request_id = output["task_id"], output["request_id"]
+        await asyncio.sleep(20)
+        tries = 0
+        resp = await AsyncClient().getImages(task_id, request_id)
+        while True:
+            if resp["code"] == 2:
+                return resp["img_urls"]
+            if tries > 15:
+                break
+            await asyncio.sleep(5)
+            resp = await AsyncClient().getImages(task_id, request_id)
+            tries += 1
+        return None
+    except Exception as e:
+        logging.warning(e)
+    finally:
+        await AsyncClient().close()
+
+
+async def _upscale_image(image: bytes) -> str:
+    content = await AsyncClient().upscale(image)
+    await AsyncClient().close()
+    upscaled_file_path = "upscaled.png"
+    with open(upscaled_file_path, "wb") as f:
+        f.write(content)
+    return upscaled_file_path
+
+
+# --- Commands ---
 
 @Client.on_message(filters.command("upscale", prefix) & filters.me)
 async def upscale(client: Client, message: Message):
     """Upscale Image Using Lexica API"""
-
     await message.edit("<code>Processing...</code>")
     try:
         photo_data = await message.download()
@@ -44,7 +92,7 @@ async def upscale(client: Client, message: Message):
     try:
         with open(photo_data, "rb") as image_file:
             image = image_file.read()
-        upscaled_image = await UpscaleImages(image)
+        upscaled_image = await _upscale_image(image)
         if message.reply_to_message:
             message_id = message.reply_to_message.id
             await message.delete()
@@ -67,37 +115,38 @@ async def lgen(client: Client, message: Message):
     try:
         await message.edit_text("<code>Processing...</code>")
 
-        models = ImageModels()
+        models = _image_models()
         models_ids = models.values()
 
         if len(message.command) > 2:
             model_id = int(message.text.split()[1])
             if model_id not in models_ids:
-                return await message.edit_text(format_module_help("lgen"))
+                return await message.edit_text(format_module_help("lexica"))
             message_id = None
             prompt = " ".join(message.text.split()[2:])
         elif message.reply_to_message and len(message.command) > 1:
             model_id = int(message.text.split()[1])
             if model_id not in models_ids:
                 return await message.edit_text(
-                    f"<b>Usage: </b><code>{prefix}lgen [model_id]* [prompt/reply to prompt]*</code>\n <b>Available Models and IDs:</b> <blockquote>{models}</blockquote>"
+                    f"<b>Usage: </b><code>{prefix}lgen [model_id]* [prompt/reply to prompt]*</code>\n"
+                    f"<b>Available Models and IDs:</b> <blockquote>{models}</blockquote>"
                 )
             message_id = message.reply_to_message.id
             prompt = message.reply_to_message.text
         else:
             return await message.edit_text(
-                f"<b>Usage: </b><code>{prefix}lgen [model_id]* [prompt/reply to prompt]*</code>\n <b>Available Models and IDs:</b> <blockquote>{models}</blockquote>"
+                f"<b>Usage: </b><code>{prefix}lgen [model_id]* [prompt/reply to prompt]*</code>\n"
+                f"<b>Available Models and IDs:</b> <blockquote>{models}</blockquote>"
             )
 
-        for key, val in models.items():
-            if val == model_id:
-                model_name = key
+        model_name = next((k for k, v in models.items() if v == model_id), str(model_id))
 
-        img = await ImageGeneration(model_id, prompt)
+        img = await _image_generation(model_id, prompt)
         if img is None or img == 1 or img == 2:
             return await message.edit_text("Something went wrong!")
         if img == 69:
             return await message.edit_text("NSFW is not allowed")
+
         img_url = img[0]
         with open("generated_image.png", "wb") as f:
             f.write(requests.get(img_url, timeout=5).content)
@@ -131,26 +180,16 @@ async def linsta(client: Client, message: Message):
                     download_url = response.json().get("content")[0].get("url")
                     soup = BeautifulSoup(requests.get(link).text, "html.parser")
                     title = soup.find("meta", property="og:title")
-                    if title:
-                        title_text = title["content"]
-                    title_text = re.sub(r"#\w+", "", title_text)
-                    title_text = title_text.replace("\n", "")
-                    title_text = re.sub(" +", " ", title_text)
-                    if ".mp4" in download_url:
-                        ext = ".mp4"
-                    elif ".jpg" in download_url:
-                        ext = ".jpg"
-                    elif ".png" in download_url:
-                        ext = ".png"
-                    elif ".webp" in download_url:
-                        ext = ".webp"
-                    elif ".gif" in download_url:
-                        ext = ".gif"
+                    title_text = title["content"] if title else ""
+                    title_text = re.sub(r"#\w+", "", title_text).replace("\n", "")
+                    title_text = re.sub(" +", " ", title_text)
+                    ext = next(
+                        (e for e in (".mp4", ".jpg", ".png", ".webp", ".gif") if e in download_url),
+                        ".mp4",
+                    )
                     with open(f"video_insta{ext}", "wb") as f:
                         f.write(requests.get(download_url).content)
-                    await message.edit_text(
-                        "Video downloaded successfully... Uploading"
-                    )
+                    await message.edit_text("Video downloaded successfully... Uploading")
                     await client.send_video(
                         message.chat.id,
                         f"video_insta{ext}",
