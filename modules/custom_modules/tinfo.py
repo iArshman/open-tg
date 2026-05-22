@@ -11,15 +11,11 @@ from utils.scripts import import_library
 from PIL import Image
 from PIL.ExifTags import TAGS
 from mutagen import File as MutagenFile
+from utils.misc import prefix, modules_help
 
 # Fix Python path to include parent directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-try:
-    from utils.config import prefix
-except ImportError:
-    prefix = "."  # Fallback prefix
-    print("Warning: Could not import prefix from utils.config. Using fallback prefix '.'")
 
 # Initialize libraries
 humanize = import_library("humanize", "python-humanize")
