@@ -448,7 +448,7 @@ async def load_module(
         module = importlib.import_module(path)
     except ImportError as e:
         if core:
-            # Core modules shouldn't raise ImportError
+           
             raise
 
         if not packages:
@@ -492,7 +492,7 @@ async def load_module(
 
     module.__meta__ = meta
 
-    # Fix 5: refresh help navigator so new module appears in .help
+
     from utils.module import ModuleManager
     help_navigator = ModuleManager.get_instance().help_navigator
     if help_navigator:
@@ -509,14 +509,14 @@ async def unload_module(module_name: str, client: Client) -> bool:
     module = importlib.import_module(path)
 
     for _name, obj in vars(module).items():
-        if isinstance(getattr(obj, "handlers", []), list):  # Fix: guard against non-list handlers
+        if isinstance(getattr(obj, "handlers", []), list):  
             for handler, group in getattr(obj, "handlers", []):
                 client.remove_handler(handler, group)
 
-    modules_help.pop(module_name, None)  # Fix: safe pop, no KeyError if missing
+    modules_help.pop(module_name, None)  
     del sys.modules[path]
 
-    # Fix 5: refresh help navigator so unloaded module disappears from .help
+   
     from utils.module import ModuleManager
     help_navigator = ModuleManager.get_instance().help_navigator
     if help_navigator:
