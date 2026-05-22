@@ -125,28 +125,8 @@ async def main():
         handlers=[logging.FileHandler("moonlogs.txt"), logging.StreamHandler()],
         level=logging.INFO,
     )
+
     DeleteAccount.__new__ = None
-
-    # Patch Pyrogram's remove_handler to suppress ValueError
-    from pyrogram import dispatcher
-    original_remove_handler = dispatcher.Dispatcher.remove_handler
-
-    async def patched_remove_handler(self, handler, group):
-        async def wrapped():
-            try:
-                self.groups[group].remove(handler)
-            except ValueError:
-                pass
-
-        await self.handler_worker_tasks[0]
-        await self.locks_list[group].acquire()
-
-        task = self.loop.create_task(wrapped())
-        await task
-
-        self.locks_list[group].release()
-
-    dispatcher.Dispatcher.remove_handler = patched_remove_handler
 
     try:
         await app.start()
@@ -160,6 +140,7 @@ async def main():
         raise
 
     load_missing_modules()
+
     module_manager = ModuleManager.get_instance()
     await module_manager.load_modules(app)
 
@@ -168,13 +149,19 @@ async def main():
             "restart": "<b>Restart completed!</b>",
             "update": "<b>Update process completed!</b>",
         }[info["type"]]
+
         try:
-            await app.edit_message_text(info["chat_id"], info["message_id"], text)
+            await app.edit_message_text(
+                info["chat_id"],
+                info["message_id"],
+                text
+            )
         except errors.RPCError:
             pass
+
         db.remove("core.updater", "restart_info")
 
-    # required for sessionkiller module
+    # Required for sessionkiller module
     if db.get("core.sessionkiller", "enabled", False):
         db.set(
             "core.sessionkiller",
