@@ -217,9 +217,7 @@ def get_chat_history(topic_id, user_message, user_name):
         if len(chat_history) > max_history_length:
             chat_history = [chat_history[0]] + chat_history[-(max_history_length-1):]
 
-    set_nested(data, ["topics", topic_id, "history"], chat_history)
-    save_module_data(data)
-    
+    # Do NOT save here — only save after a successful bot response
     return chat_history, effective_role_content
 
 # --- UTILITIES ---
@@ -334,22 +332,7 @@ async def upload_file_to_gemini(file_path, file_type):
         raise ValueError(f"{file_type.capitalize()} failed to process.")
     return uploaded_file
 
-def load_group_message_queue(topic_id):
-    data = get_module_data()
-    data = get_nested(data, ["topics", topic_id, "queue"])
-    return deque(data) if data else deque()
-
-def save_group_message_to_db(topic_id, message_text):
-    data = get_module_data()
-    queue = get_nested(data, ["topics", topic_id, "queue"], [])
-    queue.append(message_text)
-    set_nested(data, ["topics", topic_id, "queue"], queue)
-    save_module_data(data)
-
-def clear_group_message_queue(topic_id):
-    data = get_module_data()
-    set_nested(data, ["topics", topic_id, "queue"], []) 
-    save_module_data(data)
+# Queue is RAM-only — no DB persistence
 
 group_message_queues = defaultdict(deque)
 active_topics = set()
@@ -377,11 +360,7 @@ async def wchat(client: Client, message: Message):
         if user_message.startswith("Reacted to this message with"):
             return
 
-        if topic_id not in group_message_queues or not group_message_queues[topic_id]:
-            group_message_queues[topic_id] = load_group_message_queue(topic_id)
-
         group_message_queues[topic_id].append(user_message)
-        save_group_message_to_db(topic_id, user_message)
 
         if topic_id in active_topics:
             return
@@ -407,7 +386,6 @@ async def process_group_messages(client, message, topic_id, user_name):
             
             if is_explicitly_disabled or is_not_enabled_by_group:
                 group_message_queues[topic_id].clear()
-                clear_group_message_queue(topic_id)
                 active_topics.discard(topic_id)
                 return 
             # --- END FIX ---
@@ -424,7 +402,6 @@ async def process_group_messages(client, message, topic_id, user_name):
                 break
 
             combined_message = " ".join(batch)
-            clear_group_message_queue(topic_id)
 
             chat_history_list, bot_role = get_chat_history(topic_id, combined_message, user_name)
             full_prompt = build_gemini_prompt(bot_role, chat_history_list, combined_message)
@@ -438,10 +415,10 @@ async def process_group_messages(client, message, topic_id, user_name):
                 if len(bot_response) > max_length:
                     bot_response = bot_response[:max_length] + "..."
                     
+                # Save user message + bot response together only on success
+                chat_history_list.append(bot_response)
                 data = get_module_data()
-                history = get_nested(data, ["topics", topic_id, "history"], [])
-                history.append(bot_response)
-                set_nested(data, ["topics", topic_id, "history"], history)
+                set_nested(data, ["topics", topic_id, "history"], chat_history_list)
                 save_module_data(data)
 
             except ValueError as ve: 
@@ -642,7 +619,9 @@ async def wchat_command(client: Client, message: Message):
         elif command == "del":
             save_topic_data_field(target_topic_id, "history", [])
             save_topic_data_field(target_topic_id, "role_active", None)
-            await message.edit_text(f"<b>Chat history deleted for topic {target_topic_id}.</b>")
+            group_message_queues[target_topic_id].clear()
+            active_topics.discard(target_topic_id)
+            await message.edit_text(f"<b>Chat history and pending queue deleted for topic {target_topic_id}.</b>")
 
         else:
             await message.edit_text(
