@@ -128,6 +128,23 @@ async def main():
 
     DeleteAccount.__new__ = None
 
+    # Patch Pyrogram's remove_handler to suppress ValueError
+    from pyrogram import dispatcher
+
+    async def patched_remove_handler(self, handler, group):
+        async def wrapped():
+            try:
+                self.groups[group].remove(handler)
+            except (ValueError, KeyError):
+                pass
+
+        await self.handler_worker_tasks[0]
+
+        async with self.locks_list[group]:
+            await wrapped()
+
+    dispatcher.Dispatcher.remove_handler = patched_remove_handler
+
     try:
         await app.start()
     except (errors.NotAcceptable, errors.Unauthorized) as e:
@@ -161,7 +178,6 @@ async def main():
 
         db.remove("core.updater", "restart_info")
 
-    # Required for sessionkiller module
     if db.get("core.sessionkiller", "enabled", False):
         db.set(
             "core.sessionkiller",
@@ -179,7 +195,6 @@ async def main():
     await idle()
 
     await app.stop()
-
 
 if __name__ == "__main__":
     app.run(main())
