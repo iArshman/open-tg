@@ -55,6 +55,8 @@ _mongo_client = pymongo.MongoClient(config.db_url)
 
 
 def get_chat_history(user_id, bot_role, user_message, user_name):
+    """Load history and append user message — does NOT save to DB yet.
+    DB is only written after a successful bot response."""
     chat_history = db.get(collection, f"chat_history.{user_id}") or [f"Role: {bot_role}"]
     if not isinstance(chat_history, list):
         chat_history = [f"Role: {bot_role}"]
@@ -62,7 +64,6 @@ def get_chat_history(user_id, bot_role, user_message, user_name):
     max_history_length = 50
     if len(chat_history) > max_history_length:
         chat_history = [chat_history[0]] + chat_history[-(max_history_length-1):]
-    db.set(collection, f"chat_history.{user_id}", chat_history)
     return chat_history
 
 # ================================
@@ -551,7 +552,7 @@ async def process_messages(client, message, user_id, user_name):
                 if len(bot_response) > max_length:
                     bot_response = bot_response[:max_length] + "..."
 
-                # Append response to in-memory history (get_chat_history already persisted user msg)
+                # Save user message + bot response together only on success
                 chat_history_list.append(bot_response)
                 db.set(collection, f"chat_history.{user_id}", chat_history_list)
 
@@ -751,12 +752,14 @@ async def gchat_command(client: Client, message: Message):
             await client.send_message("me", f"<b>gchat disabled for user {user_id}.</b>")
         elif command == "del":
             db.set(collection, f"chat_history.{user_id}", None)
-            await client.send_message("me", f"<b>Chat history deleted for user {user_id}.</b>")
+            user_message_queues[user_id].clear()
+            await client.send_message("me", f"<b>Chat history and pending queue deleted for user {user_id}.</b>")
         elif command == "dell" and len(parts) > 2 and parts[2].lower() == "all":
-            all_users = set(enabled_users + disabled_users)
+            all_users = set(list(enabled_users) + list(disabled_users))
             for uid in all_users:
                 db.set(collection, f"chat_history.{uid}", None)
-            await client.send_message("me", "<b>Chat history deleted for all users.</b>")
+                user_message_queues[uid].clear()
+            await client.send_message("me", "<b>Chat history and pending queues deleted for all users.</b>")
         elif command == "all":
             gchat_for_all = not gchat_for_all
             db.set(collection, "gchat_for_all", gchat_for_all)
