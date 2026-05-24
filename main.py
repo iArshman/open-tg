@@ -1,10 +1,7 @@
 import os
 import logging
-import platform
-import warnings
 
-# Suppress google.api_core Python version FutureWarning (harmless, no fix needed)
-warnings.filterwarnings("ignore", category=FutureWarning, module="google")
+import platform
 
 from pyrogram import Client, idle, errors
 from pyrogram.enums.parse_mode import ParseMode
@@ -21,7 +18,6 @@ from utils.module import ModuleManager
 SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
 if SCRIPT_PATH != os.getcwd():
     os.chdir(SCRIPT_PATH)
-
 
 if not config.STRINGSESSION:
     raise RuntimeError(
@@ -92,11 +88,20 @@ async def main():
     from pyrogram import dispatcher
     original_remove_handler = dispatcher.Dispatcher.remove_handler
 
-    def patched_remove_handler(self, handler, group):
-        try:
-            original_remove_handler(self, handler, group)
-        except ValueError:
-            pass
+    async def patched_remove_handler(self, handler, group):
+        async def wrapped():
+            try:
+                self.groups[group].remove(handler)
+            except ValueError:
+                pass
+
+        await self.handler_worker_tasks[0]
+        await self.locks_list[group].acquire()
+
+        task = self.loop.create_task(wrapped())
+        await task
+
+        self.locks_list[group].release()
 
     dispatcher.Dispatcher.remove_handler = patched_remove_handler
 
