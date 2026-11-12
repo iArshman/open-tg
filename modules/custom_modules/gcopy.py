@@ -21,6 +21,7 @@ _cancel:  bool = False
 
 TEMP_DIR   = "gcopy_temp"
 SEND_DELAY = 1.2
+MIN_PASSWORD_LEN = 10
 
 
 def _reset():
@@ -443,7 +444,39 @@ async def gdownload(client: Client, message: Message):
         f"Check your <b>Saved Messages</b>."
     )
 
-# ── .gdlp (Password Protected Download) ──────────────────────────────────────
+
+# ── .gdlp (Private / Encrypted Download) ─────────────────────────────────────
+#
+# Privacy design:
+#   * The command message containing the password is DELETED immediately.
+#   * Password is NEVER written to captions, status messages or logs.
+#   * Output is a 2-layer archive: the inner ZIP (with real folder/file names)
+#     is stored as a single AES-256 encrypted entry called "data.bin" inside
+#     a generic-named outer ZIP, so file names / chat names / topic names are
+#     NOT visible without the password.
+#   * Caption, file name and status messages contain no chat/topic names.
+#   * All temp files are removed afterwards.
+#
+# To open:  extract outer zip with password (7-Zip / WinRAR) -> you get
+#           data.bin -> rename to data.zip -> extract (no password needed).
+
+def _build_locked_zip(run_dir: str, inner_path: str, outer_path: str, password: str):
+    """Blocking helper (run in a thread). Builds inner zip then AES-256 wraps it."""
+    with zipfile.ZipFile(inner_path, "w", zipfile.ZIP_STORED) as zf:
+        for root, _, files in os.walk(run_dir):
+            for fname in files:
+                full = os.path.join(root, fname)
+                zf.write(full, arcname=os.path.relpath(full, run_dir))
+
+    with pyzipper.AESZipFile(
+        outer_path, "w",
+        compression=pyzipper.ZIP_DEFLATED,
+        encryption=pyzipper.WZ_AES,
+    ) as zf:
+        zf.setpassword(password.encode("utf-8"))
+        zf.setencryption(pyzipper.WZ_AES, nbits=256)
+        zf.write(inner_path, arcname="data.bin")
+
 
 @Client.on_message(filters.command(["gdlp"], prefix) & filters.me)
 async def gdownload_protected(client: Client, message: Message):
@@ -452,13 +485,35 @@ async def gdownload_protected(client: Client, message: Message):
     args = message.command[1:]
     auto_src = message.chat.id
     auto_thread = message.message_thread_id
+    cmd_chat = message.chat.id
 
-    # Password check
     if len(args) == 0:
-        return await message.edit(f"❌ <b>Password required!</b>\nUsage: <code>{prefix}gdlp &lt;password&gt; [chat_id] [thread_id]</code>")
+        return await message.edit(
+            f"❌ <b>Password required!</b>\n"
+            f"Usage: <code>{prefix}gdlp &lt;password&gt; [chat_id] [thread_id]</code>\n"
+            f"Password min {MIN_PASSWORD_LEN} chars, no spaces."
+        )
 
     password = args[0]
     target_args = args[1:]
+
+    # Remove the command (which contains the password) from chat right away.
+    try:
+        await message.delete()
+    except Exception:
+        try:
+            await message.edit("🔐 …")
+        except Exception:
+            pass
+
+    status = await client.send_message(
+        cmd_chat, "🔐 Preparing…", message_thread_id=auto_thread
+    )
+
+    if len(password) < MIN_PASSWORD_LEN:
+        return await status.edit(
+            f"❌ Password too short (min {MIN_PASSWORD_LEN} characters). Use a long random one."
+        )
 
     # Target assignment
     if len(target_args) == 0:
@@ -467,14 +522,14 @@ async def gdownload_protected(client: Client, message: Message):
         try:
             src_id = int(target_args[0]); thread_id = None
         except ValueError:
-            return await message.edit("❌ Invalid chat ID.")
+            return await status.edit("❌ Invalid chat ID.")
     elif len(target_args) == 2:
         try:
             src_id = int(target_args[0]); thread_id = int(target_args[1])
         except ValueError:
-            return await message.edit("❌ Invalid IDs.")
+            return await status.edit("❌ Invalid IDs.")
     else:
-        return await message.edit(
+        return await status.edit(
             f"<b>Usage:</b>\n"
             f"<code>{prefix}gdlp &lt;pass&gt;</code> — current thread\n"
             f"<code>{prefix}gdlp &lt;pass&gt; &lt;chat_id&gt;</code> — all threads\n"
@@ -482,7 +537,7 @@ async def gdownload_protected(client: Client, message: Message):
         )
 
     if _running:
-        return await message.edit(f"⚠️ Job running. Use <code>{prefix}gcopystop</code> to cancel.")
+        return await status.edit(f"⚠️ Job running. Use <code>{prefix}gcopystop</code> to cancel.")
 
     _running = True; _cancel = False
 
@@ -495,14 +550,9 @@ async def gdownload_protected(client: Client, message: Message):
     run_dir = os.path.join(TEMP_DIR, _ts())
     os.makedirs(run_dir, exist_ok=True)
 
-    status = await message.edit(f"⏳ Resolving topic names for <b>{chat_title}</b>…")
     topic_names = await _get_topic_names(client, src_id)
 
-    await status.edit(
-        f"⏳ <b>Fetching messages fast…</b>\n"
-        f"<b>{chat_title}</b> — {len(topic_names)} topics found"
-        + (f" › thread <code>{thread_id}</code>" if thread_id else "")
-    )
+    await status.edit("⏳ <b>Fetching messages…</b>")
 
     try:
         msgs = await _fetch_all(client, src_id, thread_id, status)
@@ -523,7 +573,7 @@ async def gdownload_protected(client: Client, message: Message):
 
     media_total = sum(1 for m in msgs if m.media and not _is_service(m))
     await status.edit(
-        f"📥 <b>{total} messages</b> in <b>{len(threads)} thread(s)</b> — {media_total} media\n"
+        f"📥 <b>{total} messages</b> — {media_total} media\n"
         f"<code>{prefix}gcopystop</code> to cancel."
     )
 
@@ -569,7 +619,7 @@ async def gdownload_protected(client: Client, message: Message):
             if processed % 20 == 0:
                 try:
                     await status.edit(
-                        f"📥 <b>{processed}/{total}</b> — 📁 <b>{folder_name}</b>\n"
+                        f"📥 <b>{processed}/{total}</b>\n"
                         f"Media: ✅ {downloaded} ❌ {failed}"
                     )
                 except Exception:
@@ -592,63 +642,60 @@ async def gdownload_protected(client: Client, message: Message):
         shutil.rmtree(run_dir, ignore_errors=True)
         return await status.edit(f"🛑 Cancelled. Processed {processed}/{total}.")
 
-    await status.edit(f"🗜 Creating Password-Protected ZIP (Pass: {password})…")
+    await status.edit("🗜 Encrypting (AES-256)…")
 
-    if thread_id:
-        zip_label = _safe_name(topic_names.get(thread_id, f"thread_{thread_id}"))
-    else:
-        zip_label = chat_title
+    stamp = _ts()
+    inner_path = os.path.join(TEMP_DIR, f"{stamp}_inner.tmp")
+    zip_name = os.path.join(TEMP_DIR, f"backup_{stamp}.zip")
 
-    zip_name = os.path.join(TEMP_DIR, f"{zip_label}_locked.zip")
-    
-    # Secure Password Protected Zip Creation using Pyzipper
+    def _cleanup_files():
+        shutil.rmtree(run_dir, ignore_errors=True)
+        for p in (inner_path, zip_name):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
     try:
-        with pyzipper.AESZipFile(zip_name, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
-            zf.setpassword(password.encode('utf-8'))
-            for root, _, files in os.walk(run_dir):
-                for fname in files:
-                    full = os.path.join(root, fname)
-                    arc_name = os.path.relpath(full, run_dir)
-                    zf.write(full, arcname=arc_name)
+        await asyncio.to_thread(_build_locked_zip, run_dir, inner_path, zip_name, password)
     except Exception as e:
         _reset()
-        shutil.rmtree(run_dir, ignore_errors=True)
-        return await status.edit(f"❌ Protected ZIP failed:\n<code>{format_exc(e)}</code>")
+        _cleanup_files()
+        return await status.edit(f"❌ Encryption failed:\n<code>{format_exc(e)}</code>")
+
+    # plaintext no longer needed
+    shutil.rmtree(run_dir, ignore_errors=True)
+    try:
+        os.remove(inner_path)
+    except Exception:
+        pass
 
     zip_mb = os.path.getsize(zip_name) / (1024 * 1024)
-    await status.edit(f"📤 Uploading <b>{zip_label}_locked.zip</b> ({zip_mb:.1f} MB)…")
+    await status.edit(f"📤 Uploading encrypted backup ({zip_mb:.1f} MB)…")
 
     try:
         await client.send_document(
             "me",
             document=zip_name,
-            file_name=f"{zip_label}_locked.zip",
-            caption=(
-                f"📦 <b>{zip_label} (LOCKED)</b>\nGroup: {chat_title}\n"
-                f"Password: <code>{password}</code>\n"
-                f"Threads: {len(threads)} | Messages: {total} | Media: {downloaded} | {zip_mb:.1f} MB"
-            ),
+            file_name=f"backup_{stamp}.zip",
+            caption=f"🔒 Encrypted backup | {zip_mb:.1f} MB",
             parse_mode=enums.ParseMode.HTML,
         )
     except Exception as e:
         _reset()
         return await status.edit(f"❌ Upload failed:\n<code>{format_exc(e)}</code>")
     finally:
-        shutil.rmtree(run_dir, ignore_errors=True)
-        try:
-            os.remove(zip_name)
-        except Exception:
-            pass
+        _cleanup_files()
 
     _reset()
+    password = None  # drop reference
     await status.edit(
-        f"✅ <b>Done!</b> — <code>{zip_label}_locked.zip</code>\n\n"
-        f"Password: <code>{password}</code>\n"
-        f"Threads: {len(threads)} | Messages: {total}\n"
-        f"Media: {downloaded} | Failed: {failed} | Size: {zip_mb:.1f} MB\n\n"
-        f"Check your <b>Saved Messages</b>."
+        f"✅ <b>Done!</b> Encrypted backup sent to <b>Saved Messages</b>.\n"
+        f"Messages: {total} | Media: {downloaded} | Failed: {failed} | {zip_mb:.1f} MB\n\n"
+        f"Password was not stored anywhere. Keep it in your password manager."
     )
-    
+
+
 # ── .gcopystop ───────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command(["gcopystop", "gcstop"], prefix) & filters.me)
@@ -670,5 +717,6 @@ modules_help["gcopy"] = {
     "gdownload <chat_id>": "Download ALL threads, one folder per thread → ZIP",
     "gdownload <chat_id> <thread_id>": "Download one specific thread → ZIP",
     "gdl": "Alias for gdownload",
+    "gdlp <pass> [chat_id] [thread_id]": "PRIVATE download withh pass",
     "gcopystop / gcstop": "Cancel running job",
 }
