@@ -27,3 +27,4 @@ motor
 pyzipper
 google-generativeai
 bottle
+cryptography
