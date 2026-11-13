@@ -155,6 +155,25 @@ async def _progress(status, text: str, force: bool = False):
         pass
 
 
+async def _upload_progress(current, total, status, label, started):
+    """pyrogram progress callback: live upload %, MB and speed in the status message."""
+    elapsed = max(_now() - started, 0.001)
+    speed = current / elapsed / (1024 * 1024)
+    pct = (current / total * 100) if total else 0
+    filled = int(pct // 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    eta = ""
+    if speed > 0 and total:
+        left = int((total - current) / (speed * 1024 * 1024))
+        eta = f" | ETA {left // 60}m {left % 60}s" if left >= 60 else f" | ETA {left}s"
+    await _progress(
+        status,
+        f"📤 <b>{label}</b>\n{bar} <b>{pct:.0f}%</b>\n"
+        f"{current / 1048576:.1f} / {total / 1048576:.1f} MB | {speed:.1f} MB/s{eta}",
+        force=(current >= total),
+    )
+
+
 async def _boost(client: Client):
     """pyrogram limits chunk requests to 1 at a time by default; this is the main
     reason downloads crawl. Raise it for this client."""
@@ -539,6 +558,8 @@ async def gdownload(client: Client, message: Message):
                 f"Threads: {len(threads)} | Messages: {total} | Media: {downloaded} | {zip_mb:.1f} MB"
             ),
             parse_mode=enums.ParseMode.HTML,
+            progress=_upload_progress,
+            progress_args=(status, "Uploading", _now()),
         )
     except Exception as e:
         _reset()
@@ -604,12 +625,14 @@ async def gdownload_protected(client: Client, message: Message):
     if len(args) == 0:
         return await message.edit(
             f"❌ <b>Password required!</b>\n"
-            f"Usage: <code>{prefix}gdlp &lt;password&gt; [chat_id] [thread_id]</code>\n"
+            f"Usage: <code>{prefix}gdlp &lt;password&gt; [chat_id] [thread_id] [-n]</code>\n"
+            f"<code>-n</code> = use the real chat/topic name as the zip file name (visible to anyone who sees the file).\n"
             f"Password min {MIN_PASSWORD_LEN} chars, no spaces."
         )
 
     password = args[0]
-    target_args = args[1:]
+    use_name = "-n" in args[1:]
+    target_args = [a for a in args[1:] if a != "-n"]
 
     # Remove the command (which contains the password) from chat right away.
     try:
@@ -736,7 +759,13 @@ async def gdownload_protected(client: Client, message: Message):
 
     stamp = _ts()
     inner_path = os.path.join(TEMP_DIR, f"{stamp}_inner.tmp")
-    zip_name = os.path.join(TEMP_DIR, f"backup_{stamp}.zip")
+    if use_name:
+        base = topic_names.get(thread_id, f"thread_{thread_id}") if thread_id else chat_title
+        pretty = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        out_name = f"{_safe_name(base)[:80]}_{pretty}_locked.zip"
+    else:
+        out_name = f"backup_{stamp}.zip"
+    zip_name = os.path.join(TEMP_DIR, f"{stamp}_{out_name}")
 
     def _cleanup_files():
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -767,8 +796,14 @@ async def gdownload_protected(client: Client, message: Message):
         await client.send_document(
             "me",
             document=zip_name,
-            file_name=f"backup_{stamp}.zip",
+            file_name=out_name,
+            caption=(
+                f"🔒 <b>{_safe_name(base)[:80]}</b>\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')} | {zip_mb:.1f} MB"
+                if use_name else f"🔒 Encrypted backup | {zip_mb:.1f} MB"
+            ),
             parse_mode=enums.ParseMode.HTML,
+            progress=_upload_progress,
+            progress_args=(status, "Uploading encrypted backup", _now()),
         )
     except Exception as e:
         _reset()
@@ -806,6 +841,6 @@ modules_help["gcopy"] = {
     "gdownload <chat_id>": "Download ALL threads, one folder per thread → ZIP",
     "gdownload <chat_id> <thread_id>": "Download one specific thread → ZIP",
     "gdl": "Alias for gdownload",
-    "gdlp <pass> [chat_id] [thread_id]": "PRIVATE download: AES-256, hidden file names, password deleted from chat & never stored. Run it from Saved Messages with explicit IDs",
+    "gdlp <pass> [chat_id] [thread_id] [-n]": "PRIVATE download: AES-256, hidden file names, password deleted from chat & never stored. Zip is named backup_<time>.zip; add -n to name it <chat/topic>_<date>_locked.zip with a date caption. Run it from Saved Messages with explicit IDs",
     "gcopystop / gcstop": "Cancel running job",
 }
