@@ -22,16 +22,26 @@ _cancel:  bool = False
 TEMP_DIR   = "gcopy_temp"
 SEND_DELAY = 1.2
 MIN_PASSWORD_LEN = 10
+DL_CONCURRENCY = 6     # media files downloaded at the same time
+FILE_SEM = 16          # pyrogram chunk requests in flight (library default is 1!)
 
 
 def _reset():
-    global _running, _cancel
+    global _running, _cancel, _flood_until
+    _flood_until = 0.0
     _running = False
     _cancel  = False
 
 
 def _ts() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _norm_id(n: int) -> int:
+    """Fix supergroup/channel IDs typed without the leading minus (1002586861559 -> -1002586861559)."""
+    if n > 0 and len(str(n)) >= 13 and str(n).startswith("100"):
+        return -n
+    return n
 
 
 def _safe_name(name: str) -> str:
@@ -106,25 +116,154 @@ async def _get_topic_names(client: Client, chat_id: int) -> dict[int, str]:
 
 # ── fast fetch ────────────────────────────────────────────────────────────────
 
+# ── shared flood-wait gate + throttled progress (a FloodWait hits the whole account) ──
+
+_flood_until: float = 0.0
+_last_edit: float = 0.0
+EDIT_INTERVAL = 4.0   # seconds between status edits (Telegram flood-limits edits quickly)
+
+
+def _now() -> float:
+    return asyncio.get_event_loop().time()
+
+
+async def _gate():
+    """Every request waits here while an account-wide flood wait is active."""
+    while True:
+        remaining = _flood_until - _now()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, 5))
+
+
+def _note_flood(seconds: int):
+    global _flood_until
+    _flood_until = max(_flood_until, _now() + seconds + 1)
+
+
+async def _progress(status, text: str, force: bool = False):
+    """Edit the status message at most once per EDIT_INTERVAL; never raises."""
+    global _last_edit
+    if not force and _now() - _last_edit < EDIT_INTERVAL:
+        return
+    _last_edit = _now()
+    try:
+        await status.edit(text)
+    except FloodWait as fw:
+        _note_flood(fw.value)
+    except Exception:
+        pass
+
+
+async def _boost(client: Client):
+    """pyrogram limits chunk requests to 1 at a time by default; this is the main
+    reason downloads crawl. Raise it for this client."""
+    try:
+        client.get_file_semaphore = asyncio.Semaphore(FILE_SEM)
+        client.save_file_semaphore = asyncio.Semaphore(FILE_SEM)
+    except Exception:
+        pass
+
+
+async def _warm_peer(client: Client, chat_id: int):
+    """Session is in_memory, so the peer cache is empty after every restart.
+    Load dialogs once if the chat cannot be resolved yet."""
+    try:
+        await client.get_chat(chat_id)
+        return
+    except Exception:
+        pass
+    try:
+        async for _ in client.get_dialogs():
+            pass
+    except Exception:
+        pass
+
+
 async def _fetch_all(client, src_id, thread_id, status_msg) -> list:
     msgs  = []
     count = 0
+    last  = 0.0
+
+    async def _tick():
+        nonlocal last
+        await _gate()
+        await _progress(status_msg, f"⏳ Fetching… {count} scanned, {len(msgs)} matched")
+
+    # Fast path: ask the SERVER for only this topic's messages instead of
+    # scanning the whole group history and throwing most of it away.
+    if thread_id:
+        try:
+            async for msg in client.search_messages(src_id, query="", thread_id=thread_id):
+                if _cancel:
+                    break
+                count += 1
+                msgs.append(msg)
+                await _tick()
+        except Exception:
+            msgs.clear(); count = 0
+        if msgs:
+            msgs.reverse()
+            return msgs
+
     async for msg in client.get_chat_history(src_id):
         if _cancel:
             break
         count += 1
         if thread_id and msg.message_thread_id != thread_id:
+            await _tick()
             continue
         msgs.append(msg)
-        if count % 100 == 0:
-            try:
-                await status_msg.edit(
-                    f"⏳ Fetching… {count} scanned, {len(msgs)} matched"
-                )
-            except Exception:
-                pass
+        await _tick()
     msgs.reverse()
     return msgs
+
+
+async def _dl_one(client, msg, media_dir, sem, stats):
+    async with sem:
+        for _ in range(3):
+            if _cancel:
+                return
+            await _gate()
+            try:
+                await client.download_media(msg, file_name=media_dir + "/")
+                stats["ok"] += 1
+                return
+            except FloodWait as fw:
+                _note_flood(fw.value)
+            except Exception:
+                break
+        stats["fail"] += 1
+
+
+async def _process_thread(client, thread_msgs, media_dir, status, label, done_so_far, total):
+    """Collect text instantly, download all media of the thread in parallel."""
+    text_lines, media_msgs = [], []
+    for msg in thread_msgs:
+        line = _msg_to_text(msg)
+        if line:
+            text_lines.append(line)
+        if msg.media and not _is_service(msg):
+            media_msgs.append(msg)
+
+    stats = {"ok": 0, "fail": 0}
+    sem = asyncio.Semaphore(DL_CONCURRENCY)
+    pending = {asyncio.create_task(_dl_one(client, m, media_dir, sem, stats)) for m in media_msgs}
+    all_tasks = list(pending)
+    while pending:
+        _, pending = await asyncio.wait(pending, timeout=3)
+        if _cancel:
+            for t in pending:
+                t.cancel()
+            break
+        await _progress(
+            status,
+            f"📥 <b>{done_so_far + len(thread_msgs)}/{total}</b> msgs\n"
+            f"Media: ✅ {stats['ok']} ❌ {stats['fail']} / {len(media_msgs)}"
+            + (f"\n⏸ Flood wait, resuming shortly…" if _flood_until > _now() else "")
+        )
+    await asyncio.gather(*all_tasks, return_exceptions=True)
+    return text_lines, stats["ok"], stats["fail"]
 
 
 # ── .gcopy ───────────────────────────────────────────────────────────────────
@@ -144,12 +283,12 @@ async def gcopy(client: Client, message: Message):
             return await message.edit("❌ Invalid destination ID.")
     elif len(args) == 2:
         try:
-            src_id = int(args[0]); dst_id = int(args[1]); thread_id = None
+            src_id = _norm_id(int(args[0])); dst_id = int(args[1]); thread_id = None
         except ValueError:
             return await message.edit("❌ Invalid IDs.")
     elif len(args) == 3:
         try:
-            src_id = int(args[0]); thread_id = int(args[1]); dst_id = int(args[2])
+            src_id = _norm_id(int(args[0])); thread_id = int(args[1]); dst_id = int(args[2])
         except ValueError:
             return await message.edit("❌ Invalid IDs.")
     else:
@@ -213,11 +352,13 @@ async def gcopy(client: Client, message: Message):
             skipped += 1
             continue
 
+        await _gate()
         try:
             await msg.copy(chat_id=dst_id, message_thread_id=dst_thread_id)
             copied += 1
         except FloodWait as fw:
-            await asyncio.sleep(fw.value + 1)
+            _note_flood(fw.value)
+            await _gate()
             try:
                 await msg.copy(chat_id=dst_id, message_thread_id=dst_thread_id)
                 copied += 1
@@ -226,14 +367,12 @@ async def gcopy(client: Client, message: Message):
         except Exception as e:
             last_err = str(e)[:80]; failed += 1
 
-        if i % 25 == 0 or i == total:
-            try:
-                await status.edit(
-                    f"⏳ {i}/{total} — ✅ {copied}  ⏭ {skipped}  ❌ {failed}"
-                    + (f"\n<code>{last_err}</code>" if last_err else "")
-                )
-            except Exception:
-                pass
+        await _progress(
+            status,
+            f"⏳ {i}/{total} — ✅ {copied}  ⏭ {skipped}  ❌ {failed}"
+            + (f"\n<code>{last_err}</code>" if last_err else ""),
+            force=(i == total),
+        )
         await asyncio.sleep(SEND_DELAY)
 
     _reset()
@@ -258,12 +397,12 @@ async def gdownload(client: Client, message: Message):
         src_id = auto_src; thread_id = auto_thread
     elif len(args) == 1:
         try:
-            src_id = int(args[0]); thread_id = None
+            src_id = _norm_id(int(args[0])); thread_id = None
         except ValueError:
             return await message.edit("❌ Invalid chat ID.")
     elif len(args) == 2:
         try:
-            src_id = int(args[0]); thread_id = int(args[1])
+            src_id = _norm_id(int(args[0])); thread_id = int(args[1])
         except ValueError:
             return await message.edit("❌ Invalid IDs.")
     else:
@@ -278,6 +417,8 @@ async def gdownload(client: Client, message: Message):
         return await message.edit(f"⚠️ Job running. Use <code>{prefix}gcopystop</code> to cancel.")
 
     _running = True; _cancel = False
+    await _boost(client)
+    await _warm_peer(client, src_id)
 
     try:
         chat_obj   = await client.get_chat(src_id)
@@ -341,39 +482,12 @@ async def gdownload(client: Client, message: Message):
 
         text_lines = []
 
-        for msg in thread_msgs:
-            if _cancel:
-                break
-            processed += 1
-
-            line = _msg_to_text(msg)
-            if line:
-                text_lines.append(line)
-
-            if msg.media and not _is_service(msg):
-                try:
-                    await client.download_media(msg, file_name=media_dir + "/")
-                    downloaded += 1
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.value + 1)
-                    try:
-                        await client.download_media(msg, file_name=media_dir + "/")
-                        downloaded += 1
-                    except Exception:
-                        failed += 1
-                except Exception:
-                    failed += 1
-
-            if processed % 20 == 0:
-                try:
-                    await status.edit(
-                        f"📥 <b>{processed}/{total}</b> — 📁 <b>{folder_name}</b>\n"
-                        f"Media: ✅ {downloaded} ❌ {failed}"
-                    )
-                except Exception:
-                    pass
-
-            await asyncio.sleep(0)
+        text_lines, ok, bad = await _process_thread(
+            client, thread_msgs, media_dir, status, folder_name, processed, total
+        )
+        processed += len(thread_msgs)
+        downloaded += ok
+        failed += bad
 
         # Write messages.txt (text only)
         txt_path = os.path.join(thread_dir, "messages.txt")
@@ -520,12 +634,12 @@ async def gdownload_protected(client: Client, message: Message):
         src_id = auto_src; thread_id = auto_thread
     elif len(target_args) == 1:
         try:
-            src_id = int(target_args[0]); thread_id = None
+            src_id = _norm_id(int(target_args[0])); thread_id = None
         except ValueError:
             return await status.edit("❌ Invalid chat ID.")
     elif len(target_args) == 2:
         try:
-            src_id = int(target_args[0]); thread_id = int(target_args[1])
+            src_id = _norm_id(int(target_args[0])); thread_id = int(target_args[1])
         except ValueError:
             return await status.edit("❌ Invalid IDs.")
     else:
@@ -540,6 +654,8 @@ async def gdownload_protected(client: Client, message: Message):
         return await status.edit(f"⚠️ Job running. Use <code>{prefix}gcopystop</code> to cancel.")
 
     _running = True; _cancel = False
+    await _boost(client)
+    await _warm_peer(client, src_id)
 
     try:
         chat_obj = await client.get_chat(src_id)
@@ -593,38 +709,12 @@ async def gdownload_protected(client: Client, message: Message):
         os.makedirs(media_dir, exist_ok=True)
         text_lines = []
 
-        for msg in thread_msgs:
-            if _cancel:
-                break
-            processed += 1
-
-            line = _msg_to_text(msg)
-            if line:
-                text_lines.append(line)
-
-            if msg.media and not _is_service(msg):
-                try:
-                    await client.download_media(msg, file_name=media_dir + "/")
-                    downloaded += 1
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.value + 1)
-                    try:
-                        await client.download_media(msg, file_name=media_dir + "/")
-                        downloaded += 1
-                    except Exception:
-                        failed += 1
-                except Exception:
-                    failed += 1
-
-            if processed % 20 == 0:
-                try:
-                    await status.edit(
-                        f"📥 <b>{processed}/{total}</b>\n"
-                        f"Media: ✅ {downloaded} ❌ {failed}"
-                    )
-                except Exception:
-                    pass
-            await asyncio.sleep(0)
+        text_lines, ok, bad = await _process_thread(
+            client, thread_msgs, media_dir, status, folder_name, processed, total
+        )
+        processed += len(thread_msgs)
+        downloaded += ok
+        failed += bad
 
         txt_path = os.path.join(thread_dir, "messages.txt")
         with open(txt_path, "w", encoding="utf-8") as f:
@@ -678,7 +768,6 @@ async def gdownload_protected(client: Client, message: Message):
             "me",
             document=zip_name,
             file_name=f"backup_{stamp}.zip",
-            caption=f"🔒 Encrypted backup | {zip_mb:.1f} MB",
             parse_mode=enums.ParseMode.HTML,
         )
     except Exception as e:
@@ -717,6 +806,6 @@ modules_help["gcopy"] = {
     "gdownload <chat_id>": "Download ALL threads, one folder per thread → ZIP",
     "gdownload <chat_id> <thread_id>": "Download one specific thread → ZIP",
     "gdl": "Alias for gdownload",
-    "gdlp <pass> [chat_id] [thread_id]": "PRIVATE download withh pass",
+    "gdlp <pass> [chat_id] [thread_id]": "PRIVATE download: AES-256, hidden file names, password deleted from chat & never stored. Run it from Saved Messages with explicit IDs",
     "gcopystop / gcstop": "Cancel running job",
 }
